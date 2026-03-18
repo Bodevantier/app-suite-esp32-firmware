@@ -1,0 +1,19 @@
+{
+  "C_Cpp.intelliSenseEngine": "default",
+  "idf.openOcdConfigs": [
+    "interface/ftdi/esp_ftdi.cfg",
+    "target/esp32s3.cfg"
+  ],
+  "idf.portWin": "COM7",
+  "idf.currentSetup": "C:\\esp\\v5.5.3\\esp-idf",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Simon\\Documents\\ESP32_projects\\Test _4_SPI_N2K_to_BLE\\build"
+  ],
+  "idf.flashType": "UART"
+}
