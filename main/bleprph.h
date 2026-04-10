@@ -39,6 +39,7 @@ int gatt_svr_set_notify_text(const char *text);
 int gatt_svr_chr_notify(uint16_t conn_handle);
 int gatt_svr_notify_text(uint16_t conn_handle, const char *text);
 int gatt_svr_notify_text_chunks(uint16_t conn_handle, const char *text);
+int gatt_svr_notify_binary(uint16_t conn_handle, const uint8_t *data, uint16_t len);
 void gatt_svr_set_command_handler(gatt_svr_command_handler_fn handler, void *ctx);
 
 #ifdef __cplusplus

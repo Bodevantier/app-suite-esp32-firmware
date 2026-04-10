@@ -34,11 +34,16 @@ static const ble_uuid128_t gatt_svr_svc_uuid =
                      0x8c, 0x11, 0x02, 0x67, 0x2d, 0x89, 0xb8, 0x9d);
 
 #define GATT_SVR_NOTIFY_MAX_LEN 180
+#define GATT_SVR_BINARY_MAX_LEN 180
 #define GATT_SVR_COMMAND_MAX_LEN 256
 static char gatt_svr_chr_val[GATT_SVR_NOTIFY_MAX_LEN] = "waiting for N2K data";
 static uint16_t gatt_svr_chr_val_handle;
 static const ble_uuid128_t gatt_svr_chr_uuid =
     BLE_UUID128_INIT(0x11, 0xfe, 0xf3, 0x76, 0xea, 0x81, 0x44, 0xbc,
+                     0x8c, 0x11, 0x02, 0x67, 0x2d, 0x89, 0xb8, 0x9d);
+static uint16_t gatt_svr_bin_val_handle;
+static const ble_uuid128_t gatt_svr_bin_chr_uuid =
+    BLE_UUID128_INIT(0x13, 0xfe, 0xf3, 0x76, 0xea, 0x81, 0x44, 0xbc,
                      0x8c, 0x11, 0x02, 0x67, 0x2d, 0x89, 0xb8, 0x9d);
 static uint16_t gatt_svr_cmd_val_handle;
 static const ble_uuid128_t gatt_svr_cmd_chr_uuid =
@@ -48,6 +53,33 @@ static char gatt_svr_command_buf[GATT_SVR_COMMAND_MAX_LEN];
 static size_t gatt_svr_command_len;
 static bool gatt_svr_command_overflow;
 static SemaphoreHandle_t gatt_svr_notify_lock;
+
+static int
+gatt_svr_notify_text_unlocked(uint16_t conn_handle, const char *text)
+{
+    struct os_mbuf *om;
+    int rc;
+
+    if (text == NULL) {
+        return BLE_HS_EINVAL;
+    }
+
+    rc = gatt_svr_set_notify_text(text);
+    if (rc != 0) {
+        return rc;
+    }
+
+    om = ble_hs_mbuf_from_flat(gatt_svr_chr_val, strlen(gatt_svr_chr_val));
+    if (om == NULL) {
+        return BLE_HS_ENOMEM;
+    }
+
+    rc = ble_gatts_notify_custom(conn_handle, gatt_svr_chr_val_handle, om);
+    if (rc != 0) {
+        os_mbuf_free_chain(om);
+    }
+    return rc;
+}
 static gatt_svr_command_handler_fn gatt_svr_command_handler;
 static void *gatt_svr_command_handler_ctx;
 
@@ -143,6 +175,11 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb = gatt_svc_access,
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &gatt_svr_chr_val_handle,
+            }, {
+                .uuid = &gatt_svr_bin_chr_uuid.u,
+                .access_cb = gatt_svc_access,
+                .flags = BLE_GATT_CHR_F_NOTIFY,
+                .val_handle = &gatt_svr_bin_val_handle,
             }, {
                 /* Dedicated app -> ESP32 command input. */
                 .uuid = &gatt_svr_cmd_chr_uuid.u,
@@ -322,32 +359,17 @@ gatt_svr_chr_notify(uint16_t conn_handle)
 int
 gatt_svr_notify_text(uint16_t conn_handle, const char *text)
 {
-    struct os_mbuf *om;
     int rc;
 
     if ((text == NULL) || (gatt_svr_notify_lock == NULL)) {
         return BLE_HS_EINVAL;
     }
+
     if (xSemaphoreTake(gatt_svr_notify_lock, portMAX_DELAY) != pdTRUE) {
         return BLE_HS_ETIMEOUT;
     }
 
-    rc = gatt_svr_set_notify_text(text);
-    if (rc != 0) {
-        xSemaphoreGive(gatt_svr_notify_lock);
-        return rc;
-    }
-
-    om = ble_hs_mbuf_from_flat(gatt_svr_chr_val, strlen(gatt_svr_chr_val));
-    if (om == NULL) {
-        xSemaphoreGive(gatt_svr_notify_lock);
-        return BLE_HS_ENOMEM;
-    }
-
-    rc = ble_gatts_notify_custom(conn_handle, gatt_svr_chr_val_handle, om);
-    if (rc != 0) {
-        os_mbuf_free_chain(om);
-    }
+    rc = gatt_svr_notify_text_unlocked(conn_handle, text);
     xSemaphoreGive(gatt_svr_notify_lock);
     return rc;
 }
@@ -358,8 +380,12 @@ gatt_svr_notify_text_chunks(uint16_t conn_handle, const char *text)
     size_t total_len;
     size_t offset = 0u;
 
-    if (text == NULL) {
+    if ((text == NULL) || (gatt_svr_notify_lock == NULL)) {
         return BLE_HS_EINVAL;
+    }
+
+    if (xSemaphoreTake(gatt_svr_notify_lock, portMAX_DELAY) != pdTRUE) {
+        return BLE_HS_ETIMEOUT;
     }
 
     total_len = strlen(text);
@@ -374,14 +400,44 @@ gatt_svr_notify_text_chunks(uint16_t conn_handle, const char *text)
 
         memcpy(chunk, &text[offset], chunk_len);
         chunk[chunk_len] = '\0';
-        rc = gatt_svr_notify_text(conn_handle, chunk);
+        rc = gatt_svr_notify_text_unlocked(conn_handle, chunk);
         if (rc != 0) {
+            xSemaphoreGive(gatt_svr_notify_lock);
             return rc;
         }
         offset += chunk_len;
     }
 
+    xSemaphoreGive(gatt_svr_notify_lock);
     return 0;
+}
+
+int
+gatt_svr_notify_binary(uint16_t conn_handle, const uint8_t *data, uint16_t len)
+{
+    struct os_mbuf *om;
+    int rc;
+
+    if ((data == NULL) || (len == 0u) || (len > GATT_SVR_BINARY_MAX_LEN) ||
+        (gatt_svr_notify_lock == NULL)) {
+        return BLE_HS_EINVAL;
+    }
+    if (xSemaphoreTake(gatt_svr_notify_lock, portMAX_DELAY) != pdTRUE) {
+        return BLE_HS_ETIMEOUT;
+    }
+
+    om = ble_hs_mbuf_from_flat(data, len);
+    if (om == NULL) {
+        xSemaphoreGive(gatt_svr_notify_lock);
+        return BLE_HS_ENOMEM;
+    }
+
+    rc = ble_gatts_notify_custom(conn_handle, gatt_svr_bin_val_handle, om);
+    if (rc != 0) {
+        os_mbuf_free_chain(om);
+    }
+    xSemaphoreGive(gatt_svr_notify_lock);
+    return rc;
 }
 
 void

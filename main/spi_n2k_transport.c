@@ -1,6 +1,9 @@
 #include "spi_n2k_transport.h"
 
 #include <string.h>
+#include "esp_log.h"
+
+static const char *TAG = "SPI_XPORT";
 
 static uint8_t spi_n2k_crc8(const uint8_t *data, size_t len) {
     uint8_t crc = 0u;
@@ -8,6 +11,15 @@ static uint8_t spi_n2k_crc8(const uint8_t *data, size_t len) {
         crc ^= data[i];
     }
     return crc;
+}
+
+static bool spi_n2k_is_known_packet_type(uint8_t pkt_type) {
+    return (pkt_type == SPI_N2K_PKT_TYPE_N2K_RX_FRAME) ||
+           (pkt_type == SPI_N2K_PKT_TYPE_N2K_TX_FRAME) ||
+           (pkt_type == SPI_N2K_PKT_TYPE_STATUS) ||
+           (pkt_type == SPI_N2K_PKT_TYPE_BOAT_STATE) ||
+           (pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST) ||
+           (pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST);
 }
 
 static void spi_n2k_write_u32_le(uint8_t *dst, uint32_t value) {
@@ -78,6 +90,7 @@ bool spi_n2k_transport_parser_consume_byte(SpiN2kTransportParser_t *parser, uint
         case SPI_N2K_PARSE_READ_LEN:
             parser->buf[parser->index++] = byte;
             if (byte > SPI_N2K_MAX_PAYLOAD_LEN) {
+                ESP_LOGW(TAG, "SPI bad_len type=0x%02X len=%u", parser->buf[2], (unsigned)byte);
                 parser->stats.bad_len++;
                 spi_n2k_parser_reset(parser);
                 return false;
@@ -98,6 +111,9 @@ bool spi_n2k_transport_parser_consume_byte(SpiN2kTransportParser_t *parser, uint
             }
             crc = spi_n2k_crc8(&parser->buf[2], 2u + parser->buf[3]);
             if (crc != parser->buf[parser->expected_len - 1u]) {
+                ESP_LOGW(TAG, "SPI bad_crc type=0x%02X len=%u expected=0x%02X got=0x%02X",
+                         parser->buf[2], (unsigned)parser->buf[3],
+                         crc, parser->buf[parser->expected_len - 1u]);
                 parser->stats.bad_crc++;
                 spi_n2k_parser_reset(parser);
                 return false;
@@ -109,10 +125,15 @@ bool spi_n2k_transport_parser_consume_byte(SpiN2kTransportParser_t *parser, uint
                 memcpy(out_packet->payload, &parser->buf[4], out_packet->payload_len);
             }
 
-            if ((out_packet->pkt_type != SPI_N2K_PKT_TYPE_N2K_RX_FRAME) &&
-                (out_packet->pkt_type != SPI_N2K_PKT_TYPE_N2K_TX_FRAME) &&
-                (out_packet->pkt_type != SPI_N2K_PKT_TYPE_STATUS)) {
+            if (!spi_n2k_is_known_packet_type(out_packet->pkt_type)) {
+                ESP_LOGW(TAG, "SPI unknown_type=0x%02X len=%u", out_packet->pkt_type, (unsigned)out_packet->payload_len);
                 parser->stats.unknown_type++;
+            }
+            if (out_packet->pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST ||
+                out_packet->pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST) {
+                ESP_LOGI(TAG, "SPI parsed type=0x%02X len=%u ok=%lu",
+                         out_packet->pkt_type, (unsigned)out_packet->payload_len,
+                         (unsigned long)parser->stats.packets_ok + 1u);
             }
             parser->stats.packets_ok++;
             spi_n2k_parser_reset(parser);
@@ -154,6 +175,40 @@ bool spi_n2k_transport_build_frame_packet(uint8_t pkt_type, const N2K_RawFrame_t
     i += N2K_RAW_FRAME_MAX_DATA_LEN;
     out_buf[i++] = spi_n2k_crc8(&out_buf[2], 2u + SPI_N2K_FRAME_PAYLOAD_LEN);
 
+    *out_len = i;
+    return true;
+}
+
+bool spi_n2k_transport_build_custom_packet(uint8_t pkt_type,
+                                           const uint8_t *payload,
+                                           uint8_t payload_len,
+                                           uint8_t *out_buf,
+                                           size_t out_buf_size,
+                                           size_t *out_len) {
+    size_t i = 0u;
+
+    if ((out_buf == NULL) || (out_len == NULL)) {
+        return false;
+    }
+    if ((payload_len > 0u) && (payload == NULL)) {
+        return false;
+    }
+    if (payload_len > SPI_N2K_MAX_PAYLOAD_LEN) {
+        return false;
+    }
+    if (out_buf_size < (2u + 1u + 1u + payload_len + 1u)) {
+        return false;
+    }
+
+    out_buf[i++] = SPI_N2K_SOF1;
+    out_buf[i++] = SPI_N2K_SOF2;
+    out_buf[i++] = pkt_type;
+    out_buf[i++] = payload_len;
+    if (payload_len > 0u) {
+        memcpy(&out_buf[i], payload, payload_len);
+        i += payload_len;
+    }
+    out_buf[i++] = spi_n2k_crc8(&out_buf[2], 2u + payload_len);
     *out_len = i;
     return true;
 }

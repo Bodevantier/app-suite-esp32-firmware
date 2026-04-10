@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
@@ -31,8 +31,9 @@
 #include "freertos/queue.h"
 #include "driver/spi_slave.h"
 #include "esp_attr.h"
+#include "esp_bt.h"
 #include "esp_err.h"
-#include "cJSON.h"
+#include "esp_nimble_hci.h"
 /* BLE */
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -40,11 +41,9 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "bleprph.h"
-#include "n2k_app_model.h"
-#include "n2k_can_id.h"
-#include "n2k_decoder.h"
+#include "ble_text_protocol.h"
+#include "device_list_bridge.h"
 #include "n2k_raw_frame.h"
-#include "n2k_request_manager.h"
 #include "spi_n2k_transport.h"
 
 #define SPI_SLAVE_HOST   SPI2_HOST
@@ -53,33 +52,43 @@
 #define PIN_NUM_SCLK     12
 #define PIN_NUM_CS       10
 #define SPI_RX_BUF_SIZE  256
-#define N2K_TX_QUEUE_LEN 16
+#define SPI_CUSTOM_TX_QUEUE_LEN 8
 #define N2K_LOCAL_SOURCE 0x31u
 #define N2K_PGN_ADDRESS_CLAIM 60928u
 #define N2K_PGN_SUPPORTED_PGN_LIST 126464u
 #define N2K_PGN_PRODUCT_INFO 126996u
 #define N2K_PGN_CONFIGURATION_INFO 126998u
-#define N2K_REQUEST_GAP_MS 250u
-#define N2K_LOCAL_ADDRESS_CLAIM_RETRY_MS 2000u
-#define N2K_GATEWAY_DEVICE_NAME "BLE Gateway"
-#define N2K_GATEWAY_MODEL_NAME "ESP32 SPI N2K BLE Gateway"
-#define N2K_GATEWAY_CATEGORY "gateway"
-#define N2K_INITIAL_DISCOVERY_DELAY_MS 1000u
-#define N2K_INITIAL_DISCOVERY_RETRY_MS 1000u
-#define N2K_INFO_REQUEST_RETRY_MS 5000u
-#define N2K_GLOBAL_INFO_REQUEST_RETRY_MS 1500u
-#define N2K_PGN_LIST_REQUEST_RETRY_MS 10000u
-#define N2K_MAX_INFO_REQUESTS 4u
-#define N2K_MAX_PGN_LIST_REQUESTS 2u
 #define BLE_NOTIFY_TEXT_MAX_LEN 180
+#define BLE_NOTIFY_BINARY_MAX_LEN 180
+#define BLE_NOTIFY_BINARY_PACKET_VERSION 1u
+#define BLE_NOTIFY_BINARY_PACKET_TYPE_FRAME_BATCH 1u
+#define BLE_NOTIFY_BINARY_PACKET_TYPE_BOAT_STATE 2u
+#define BLE_NOTIFY_BINARY_PACKET_HEADER_LEN 8u
+#define BLE_NOTIFY_BINARY_FRAME_LEN 14u
+#define BLE_NOTIFY_BINARY_MAX_FRAMES ((BLE_NOTIFY_BINARY_MAX_LEN - BLE_NOTIFY_BINARY_PACKET_HEADER_LEN) / BLE_NOTIFY_BINARY_FRAME_LEN)
+#define BLE_NOTIFY_BINARY_QUEUE_LEN 64
 #define BLE_NOTIFY_TASK_STACK_SIZE 8192
+#define SPI_N2K_TASK_STACK_SIZE 8192
 #define BLE_NOTIFY_TASK_IDLE_DELAY_MS 1000u
 #define BLE_NOTIFY_TASK_REFRESH_POLL_MS 200u
 #define BLE_DEVICE_LIST_REFRESH_WINDOW_MS 3000u
 #define BLE_DEVICE_LIST_REFRESH_MAX_WINDOW_MS 6000u
-#define N2K_LIVE_WIND_FRESH_MS 3000u
-#define N2K_DEVICE_ONLINE_MS 10000u
-#define N2K_DEVICE_STALE_HIDE_MS 120000u
+#define BLE_DEVICE_ADV_NAME "SDolve N2K BLE"
+
+/* BOAT_STATE BLE packet: 4-byte header + 36-byte payload = 40 bytes */
+#define BLE_BOAT_STATE_PAYLOAD_LEN 36u
+#define BLE_BOAT_STATE_PACKET_LEN  (4u + BLE_BOAT_STATE_PAYLOAD_LEN)
+
+#define DEVICE_LIST_PROTOCOL_VERSION 1u
+#define DEVICE_LIST_REQUEST_SRC 15u
+#define DEVICE_LIST_REQUEST_DST 255u
+#define DEVICE_LIST_REQUEST_PGN N2K_PGN_ADDRESS_CLAIM
+#define DEVICE_LIST_SNAPSHOT_TIMEOUT_MS 8000u
+
+typedef struct {
+    uint8_t len;
+    uint8_t data[SPI_N2K_MAX_PACKET_LEN];
+} SpiQueuedPacket_t;
 
 #if CONFIG_EXAMPLE_EXTENDED_ADV
 static uint8_t ext_adv_pattern_1[] = {
@@ -91,8 +100,10 @@ static uint8_t ext_adv_pattern_1[] = {
 #endif
 
 static const char *tag = "NimBLE_BLE_PRPH";
+static ble_uuid128_t advertised_service_uuid =
+    BLE_UUID128_INIT(0x10, 0xfe, 0xf3, 0x76, 0xea, 0x81, 0x44, 0xbc,
+                     0x8c, 0x11, 0x02, 0x67, 0x2d, 0x89, 0xb8, 0x9d);
 static int bleprph_gap_event(struct ble_gap_event *event, void *arg);
-static bool n2k_enqueue_tx_frame(const N2K_RawFrame_t *frame, void *ctx);
 #if CONFIG_EXAMPLE_RANDOM_ADDR
 static uint8_t own_addr_type = BLE_OWN_ADDR_RANDOM;
 #else
@@ -105,982 +116,224 @@ static uint16_t bearers;
 #endif
 static uint16_t active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 
-static SemaphoreHandle_t n2k_text_lock;
-static SemaphoreHandle_t n2k_model_lock;
-static char latest_n2k_text[BLE_NOTIFY_TEXT_MAX_LEN] = "waiting for N2K data";
-static char ble_notify_task_payload[BLE_NOTIFY_TEXT_MAX_LEN];
-static uint32_t latest_n2k_seq = 0;
-static QueueHandle_t n2k_tx_queue;
+static QueueHandle_t spi_custom_tx_queue;
+static QueueHandle_t ble_binary_frame_queue;
+static uint16_t ble_binary_packet_sequence = 0u;
 static N2kAppModel_t n2k_app_model;
-static N2kDecoder_t n2k_decoder;
-static N2kRequestManager_t n2k_request_manager;
+static DeviceListRequestState_t device_list_request_state = {
+    .next_request_id = 1u,
+    .pending_request_id = 0u,
+    .pending = false,
+    .last_request_ms = 0u,
+};
 static volatile bool ble_device_list_request_pending = false;
-static bool ble_device_list_refresh_active = false;
-static uint32_t ble_device_list_refresh_start_ms = 0u;
-static bool n2k_initial_discovery_request_sent = false;
-static uint32_t n2k_last_initial_discovery_attempt_ms = 0u;
-static uint32_t n2k_last_request_ms = 0u;
-static uint32_t n2k_last_global_product_request_ms = 0u;
-static uint32_t n2k_last_global_configuration_request_ms = 0u;
-static uint32_t n2k_last_global_pgn_list_request_ms = 0u;
-static bool n2k_local_address_claim_sent = false;
-static uint32_t n2k_last_local_address_claim_ms = 0u;
-static struct {
-    char name_buf[48];
-    char model_buf[48];
-    char manufacturer_buf[40];
-    char last_seen_buf[32];
-} ble_device_list_meta_scratch;
 
-static bool json_string_contains_token_ci(const char *text, const char *token)
-{
-    size_t token_len;
-    if ((text == NULL) || (token == NULL)) {
-        return false;
-    }
-    token_len = strlen(token);
-    if (token_len == 0u) {
-        return false;
-    }
-    for (const char *p = text; *p != '\0'; ++p) {
-        size_t i = 0u;
-        while ((i < token_len) && (p[i] != '\0')) {
-            char a = p[i];
-            char b = token[i];
-            if (a >= 'A' && a <= 'Z') {
-                a = (char)(a - 'A' + 'a');
-            }
-            if (b >= 'A' && b <= 'Z') {
-                b = (char)(b - 'A' + 'a');
-            }
-            if (a != b) {
-                break;
-            }
-            i++;
-        }
-        if (i == token_len) {
-            return true;
-        }
-    }
-    return false;
-}
+static bool spi_enqueue_custom_packet(const uint8_t *packet, size_t packet_len);
+static void ble_queue_binary_frame(const N2K_RawFrame_t *frame);
+static size_t ble_build_binary_packet(uint8_t *out_buf,
+                                      size_t out_buf_size,
+                                      uint16_t sequence,
+                                      const N2K_RawFrame_t *frames,
+                                      size_t frame_count);
+static bool spi_send_device_list_request(void);
+static void ble_notify_protocol_event(const char *fmt, ...);
+static void spi_log_packet_hex(const char *prefix, const uint8_t *data, size_t len);
+static void ble_publish_device_list_snapshot(void);
 
-static bool n2k_text_available(const char *text)
-{
-    return (text != NULL) && (text[0] != '\0');
-}
+static bool spi_enqueue_custom_packet(const uint8_t *packet, size_t packet_len) {
+    SpiQueuedPacket_t queued;
 
-static bool n2k_metadata_contains_keywords(const N2kDeviceEntry_t *entry,
-                                           const char *const *keywords,
-                                           size_t keyword_count,
-                                           const char **matched_field)
-{
-    if ((entry == NULL) || (keywords == NULL)) {
+    if ((packet == NULL) || (packet_len == 0u) || (packet_len > sizeof(queued.data)) ||
+        (spi_custom_tx_queue == NULL)) {
         return false;
     }
 
-    for (size_t i = 0; i < keyword_count; i++) {
-        const char *keyword = keywords[i];
-        if (json_string_contains_token_ci(entry->installation_desc1, keyword)) {
-            if (matched_field != NULL) {
-                *matched_field = "installation_desc1";
-            }
-            return true;
-        }
-        if (json_string_contains_token_ci(entry->installation_desc2, keyword)) {
-            if (matched_field != NULL) {
-                *matched_field = "installation_desc2";
-            }
-            return true;
-        }
-        if (json_string_contains_token_ci(entry->model, keyword)) {
-            if (matched_field != NULL) {
-                *matched_field = "model";
-            }
-            return true;
-        }
-        if (json_string_contains_token_ci(entry->model_id, keyword)) {
-            if (matched_field != NULL) {
-                *matched_field = "model_id";
-            }
-            return true;
-        }
-        if (json_string_contains_token_ci(entry->software_version, keyword)) {
-            if (matched_field != NULL) {
-                *matched_field = "software_version";
-            }
-            return true;
-        }
-    }
-
-    return false;
+    memset(&queued, 0, sizeof(queued));
+    queued.len = (uint8_t)packet_len;
+    memcpy(queued.data, packet, packet_len);
+    return xQueueSend(spi_custom_tx_queue, &queued, 0) == pdTRUE;
 }
 
-static const char *n2k_guess_category(const N2kDeviceEntry_t *entry, const char **selected_source)
-{
-    static const char *const wind_keywords[] = {"wind", "anemometer"};
-    static const char *const tank_keywords[] = {"tank", "fluid", "level"};
-    static const char *const battery_keywords[] = {"battery", "charger", "alternator", "voltage", "current"};
-    static const char *const temperature_keywords[] = {"temperature", "temp", "thermo"};
-    static const char *const gps_keywords[] = {"gps", "gnss", "position", "ais"};
-    static const char *const logger_keywords[] = {"logger", "logging", "record", "history", "log"};
-    static const char *const generic_keywords[] = {"gateway", "bridge", "adapter", "interface", "display", "monitor", "controller", "node"};
-    const char *matched_field = NULL;
-
-    if (entry == NULL) {
-        if (selected_source != NULL) {
-            *selected_source = "none";
-        }
-        return "unknown";
-    }
-
-    if (n2k_metadata_contains_keywords(entry, wind_keywords, sizeof(wind_keywords) / sizeof(wind_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "wind";
-    }
-    if (n2k_metadata_contains_keywords(entry, tank_keywords, sizeof(tank_keywords) / sizeof(tank_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "tank";
-    }
-    if (n2k_metadata_contains_keywords(entry, battery_keywords, sizeof(battery_keywords) / sizeof(battery_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "battery";
-    }
-    if (n2k_metadata_contains_keywords(entry, temperature_keywords, sizeof(temperature_keywords) / sizeof(temperature_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "temperature";
-    }
-    if (n2k_metadata_contains_keywords(entry, gps_keywords, sizeof(gps_keywords) / sizeof(gps_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "gps";
-    }
-    if (n2k_metadata_contains_keywords(entry, logger_keywords, sizeof(logger_keywords) / sizeof(logger_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "logger";
-    }
-    if (n2k_metadata_contains_keywords(entry, generic_keywords, sizeof(generic_keywords) / sizeof(generic_keywords[0]), &matched_field)) {
-        if (selected_source != NULL) {
-            *selected_source = matched_field;
-        }
-        return "generic";
-    }
-    if (selected_source != NULL) {
-        *selected_source = "no metadata match";
-    }
-    return "unknown";
-}
-
-static const char *n2k_best_device_name(const N2kDeviceEntry_t *entry, char *fallback_buf, size_t fallback_buf_len, const char **selected_source)
-{
-    if (entry == NULL) {
-        if (selected_source != NULL) {
-            *selected_source = "none";
-        }
-        return "Unknown device";
-    }
-    if (n2k_text_available(entry->installation_desc1)) {
-        if (selected_source != NULL) {
-            *selected_source = "installation_desc1";
-        }
-        return entry->installation_desc1;
-    }
-    if (n2k_text_available(entry->installation_desc2)) {
-        if (selected_source != NULL) {
-            *selected_source = "installation_desc2";
-        }
-        return entry->installation_desc2;
-    }
-    if (n2k_text_available(entry->model_id)) {
-        if (selected_source != NULL) {
-            *selected_source = "model_id";
-        }
-        return entry->model_id;
-    }
-    if (n2k_text_available(entry->model)) {
-        if (selected_source != NULL) {
-            *selected_source = "model";
-        }
-        return entry->model;
-    }
-    if ((fallback_buf != NULL) && (fallback_buf_len > 0u) && entry->source <= 253u) {
-        snprintf(fallback_buf, fallback_buf_len, "N2K node src %u", (unsigned)entry->source);
-        if (selected_source != NULL) {
-            *selected_source = "source fallback";
-        }
-        return fallback_buf;
-    }
-    if (selected_source != NULL) {
-        *selected_source = "unknown fallback";
-    }
-    return "Unknown device";
-}
-
-static const char *n2k_best_model(const N2kDeviceEntry_t *entry, char *fallback_buf, size_t fallback_buf_len, const char **selected_source)
-{
-    if ((entry != NULL) && n2k_text_available(entry->model_id)) {
-        if (selected_source != NULL) {
-            *selected_source = "model_id";
-        }
-        return entry->model_id;
-    }
-    if ((entry != NULL) && n2k_text_available(entry->model)) {
-        if (selected_source != NULL) {
-            *selected_source = "model";
-        }
-        return entry->model;
-    }
-    if ((entry != NULL) && n2k_text_available(entry->software_version)) {
-        if ((fallback_buf != NULL) && (fallback_buf_len > 0u)) {
-            snprintf(fallback_buf, fallback_buf_len, "SW %s", entry->software_version);
-            if (selected_source != NULL) {
-                *selected_source = "software_version";
-            }
-            return fallback_buf;
-        }
-        if (selected_source != NULL) {
-            *selected_source = "software_version";
-        }
-        return entry->software_version;
-    }
-    if ((entry != NULL) && (entry->product_code != 0u) &&
-        (fallback_buf != NULL) && (fallback_buf_len > 0u)) {
-        snprintf(fallback_buf, fallback_buf_len, "Product code %u", (unsigned)entry->product_code);
-        if (selected_source != NULL) {
-            *selected_source = "product_code";
-        }
-        return fallback_buf;
-    }
-    if (selected_source != NULL) {
-        *selected_source = "unknown fallback";
-    }
-    return "Unknown model";
-}
-
-static const char *n2k_best_manufacturer(const N2kDeviceEntry_t *entry, char *buf, size_t buf_len, const char **selected_source)
-{
-    if ((entry != NULL) && n2k_text_available(entry->manufacturer_text)) {
-        if (selected_source != NULL) {
-            *selected_source = "manufacturer_text";
-        }
-        return entry->manufacturer_text;
-    }
-    if ((buf == NULL) || (buf_len == 0u)) {
-        if (selected_source != NULL) {
-            *selected_source = "invalid buffer";
-        }
-        return "Unknown manufacturer";
-    }
-    if ((entry != NULL) && entry->manufacturer_code != 0u) {
-        snprintf(buf, buf_len, "Manufacturer code %u", (unsigned)entry->manufacturer_code);
-        if (selected_source != NULL) {
-            *selected_source = "manufacturer_code";
-        }
-        return buf;
-    }
-    snprintf(buf, buf_len, "Unknown manufacturer");
-    if (selected_source != NULL) {
-        *selected_source = "unknown fallback";
-    }
-    return buf;
-}
-
-static bool n2k_format_last_seen_utc(const N2kDeviceEntry_t *entry, char *buf, size_t buf_len)
-{
-    time_t now_epoch;
-    uint32_t now_ms;
-    uint32_t age_ms;
-    time_t seen_epoch;
-    struct tm seen_tm;
-
-    if ((entry == NULL) || (buf == NULL) || (buf_len == 0u) || (entry->last_seen_ms == 0u)) {
-        return false;
-    }
-
-    now_epoch = time(NULL);
-    if (now_epoch < 1700000000) {
-        return false;
-    }
-
-    now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    age_ms = (now_ms >= entry->last_seen_ms) ? (now_ms - entry->last_seen_ms) : 0u;
-    seen_epoch = now_epoch - (time_t)(age_ms / 1000u);
-    if (gmtime_r(&seen_epoch, &seen_tm) == NULL) {
-        return false;
-    }
-
-    return strftime(buf, buf_len, "%Y-%m-%dT%H:%M:%SZ", &seen_tm) > 0u;
-}
-
-static bool n2k_get_live_wind_source(uint8_t *source_out)
-{
-    bool valid = false;
-    uint32_t now_ms;
-
-    if ((source_out == NULL) || (n2k_model_lock == NULL)) {
-        return false;
-    }
-    if (xSemaphoreTake(n2k_model_lock, portMAX_DELAY) != pdTRUE) {
-        return false;
-    }
-
-    now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (n2k_app_model.wind.valid &&
-        (n2k_app_model.wind.updated_ms != 0u) &&
-        ((uint32_t)(now_ms - n2k_app_model.wind.updated_ms) <= N2K_LIVE_WIND_FRESH_MS)) {
-        *source_out = n2k_app_model.wind.source;
-        valid = true;
-    }
-
-    xSemaphoreGive(n2k_model_lock);
-    return valid;
-}
-
-static bool n2k_is_remote_entry(const N2kDeviceEntry_t *entry)
-{
-    return (entry != NULL) && entry->used && (entry->source != N2K_LOCAL_SOURCE);
-}
-
-static bool n2k_entry_old_enough_for_request(const N2kDeviceEntry_t *entry, uint32_t now_ms)
-{
-    if ((entry == NULL) || (entry->first_seen_ms == 0u)) {
-        return false;
-    }
-    return (uint32_t)(now_ms - entry->first_seen_ms) >= N2K_INITIAL_DISCOVERY_DELAY_MS;
-}
-
-static bool n2k_entry_seen_within_window(const N2kDeviceEntry_t *entry, uint32_t now_ms, uint32_t window_ms)
-{
-    if ((entry == NULL) || (entry->last_seen_ms == 0u)) {
-        return false;
-    }
-    return (uint32_t)(now_ms - entry->last_seen_ms) <= window_ms;
-}
-
-static bool n2k_request_retry_due(uint32_t now_ms, uint32_t last_request_ms, uint32_t retry_ms)
-{
-    return (last_request_ms == 0u) || ((uint32_t)(now_ms - last_request_ms) >= retry_ms);
-}
-
-static bool n2k_request_gap_elapsed(uint32_t now_ms)
-{
-    return (n2k_last_request_ms == 0u) || ((uint32_t)(now_ms - n2k_last_request_ms) >= N2K_REQUEST_GAP_MS);
-}
-
-static bool n2k_entry_has_useful_metadata(const N2kDeviceEntry_t *entry)
-{
-    return (entry != NULL) &&
-           entry->has_address_claim &&
-           entry->has_product_info &&
-           entry->has_configuration_info;
-}
-
-static bool n2k_entry_needs_pgn_list_enrichment(const N2kDeviceEntry_t *entry)
-{
-    return (entry != NULL) &&
-           (!entry->has_tx_pgn_list || !entry->has_rx_pgn_list);
-}
-
-static void n2k_add_supported_pgns_json(cJSON *supported_pgns, const N2kDeviceEntry_t *entry)
-{
-    if ((supported_pgns == NULL) || (entry == NULL)) {
+static void ble_queue_binary_frame(const N2K_RawFrame_t *frame) {
+    if ((frame == NULL) || (ble_binary_frame_queue == NULL)) {
         return;
     }
 
-    for (uint8_t i = 0u; i < entry->supported_pgn_count; i++) {
-        cJSON_AddItemToArray(supported_pgns, cJSON_CreateNumber((double)entry->supported_pgns[i]));
-    }
+    (void)xQueueSend(ble_binary_frame_queue, frame, 0);
 }
 
-static void n2k_collect_refresh_status(size_t *tracked_devices,
-                                       size_t *useful_incomplete_devices,
-                                       size_t *pgn_enrichment_pending_devices)
-{
-    size_t tracked = 0u;
-    size_t useful_incomplete = 0u;
-    size_t pgn_pending = 0u;
+static size_t ble_build_binary_packet(uint8_t *out_buf,
+                                      size_t out_buf_size,
+                                      uint16_t sequence,
+                                      const N2K_RawFrame_t *frames,
+                                      size_t frame_count) {
+    size_t offset = 0u;
 
-    if ((n2k_model_lock == NULL) || (xSemaphoreTake(n2k_model_lock, portMAX_DELAY) != pdTRUE)) {
-        if (tracked_devices != NULL) {
-            *tracked_devices = 0u;
-        }
-        if (useful_incomplete_devices != NULL) {
-            *useful_incomplete_devices = 0u;
-        }
-        if (pgn_enrichment_pending_devices != NULL) {
-            *pgn_enrichment_pending_devices = 0u;
-        }
-        return;
-    }
-
-    for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-        const N2kDeviceEntry_t *entry = &n2k_app_model.devices.entries[i];
-        if (!n2k_is_remote_entry(entry)) {
-            continue;
-        }
-
-        tracked++;
-        if (!n2k_entry_has_useful_metadata(entry)) {
-            useful_incomplete++;
-        }
-        if (n2k_entry_needs_pgn_list_enrichment(entry)) {
-            pgn_pending++;
-        }
-    }
-
-    xSemaphoreGive(n2k_model_lock);
-
-    if (tracked_devices != NULL) {
-        *tracked_devices = tracked;
-    }
-    if (useful_incomplete_devices != NULL) {
-        *useful_incomplete_devices = useful_incomplete;
-    }
-    if (pgn_enrichment_pending_devices != NULL) {
-        *pgn_enrichment_pending_devices = pgn_pending;
-    }
-}
-static bool n2k_send_request(uint8_t destination,
-                             uint32_t requested_pgn,
-                             uint32_t now_ms)
-{
-    bool result = n2k_request_manager_send_request(&n2k_request_manager, destination, requested_pgn, now_ms);
-
-    if (result) {
-        n2k_last_request_ms = now_ms;
-    }
-    return result;
-}
-
-static uint64_t n2k_local_name_value(void)
-{
-    const uint64_t unique_number = 0x12345u;
-    const uint64_t manufacturer_code = 2046u;
-    const uint64_t device_instance_lower = 0u;
-    const uint64_t device_instance_upper = 0u;
-    const uint64_t device_function = 130u;
-    const uint64_t device_class = 85u;
-    const uint64_t system_instance = 0u;
-    const uint64_t industry_group = 4u;
-    const uint64_t arbitrary_address_capable = 1u;
-
-    return (unique_number & 0x1FFFFFu)
-           | ((manufacturer_code & 0x7FFu) << 21u)
-           | ((device_instance_lower & 0x07u) << 32u)
-           | ((device_instance_upper & 0x1Fu) << 35u)
-           | ((device_function & 0xFFu) << 40u)
-           | ((device_class & 0x7Fu) << 49u)
-           | ((system_instance & 0x0Fu) << 56u)
-           | ((industry_group & 0x07u) << 60u)
-           | ((arbitrary_address_capable & 0x01u) << 63u);
-}
-
-static bool n2k_send_local_address_claim(uint32_t now_ms, const char *reason)
-{
-    N2K_RawFrame_t frame;
-    uint32_t can_id = 0u;
-    uint64_t name = n2k_local_name_value();
-    bool result;
-
-    if (!n2k_can_id_build_29bit(6u, N2K_PGN_ADDRESS_CLAIM, N2K_LOCAL_SOURCE, 0xFFu, &can_id)) {
-        return false;
-    }
-
-    n2k_raw_frame_clear(&frame);
-    frame.timestamp_ms = now_ms;
-    frame.can_id = can_id;
-    frame.dlc = 8u;
-    frame.flags = N2K_RAW_FLAG_EXTENDED_ID;
-    for (uint8_t i = 0u; i < 8u; i++) {
-        frame.data[i] = (uint8_t)((name >> (8u * i)) & 0xFFu);
-    }
-
-    result = n2k_enqueue_tx_frame(&frame, n2k_tx_queue);
-    if (result) {
-        n2k_last_request_ms = now_ms;
-        n2k_last_local_address_claim_ms = now_ms;
-        n2k_local_address_claim_sent = true;
-    }
-    return result;
-}
-
-static bool n2k_ensure_local_address_claim(uint32_t now_ms, const char *reason)
-{
-    if (!n2k_request_gap_elapsed(now_ms)) {
-        return false;
-    }
-
-    if (!n2k_local_address_claim_sent ||
-        n2k_request_retry_due(now_ms, n2k_last_local_address_claim_ms, N2K_LOCAL_ADDRESS_CLAIM_RETRY_MS)) {
-        return n2k_send_local_address_claim(now_ms, reason);
-    }
-
-    return false;
-}
-
-static bool n2k_request_initial_discovery_if_needed(uint32_t now_ms)
-{
-    if (n2k_ensure_local_address_claim(now_ms, "announce local source before discovery")) {
-        return true;
-    }
-
-    if (n2k_initial_discovery_request_sent || !n2k_request_gap_elapsed(now_ms)) {
-        return false;
-    }
-    if (now_ms < N2K_INITIAL_DISCOVERY_DELAY_MS) {
-        return false;
-    }
-    if ((n2k_last_initial_discovery_attempt_ms != 0u) &&
-        ((uint32_t)(now_ms - n2k_last_initial_discovery_attempt_ms) < N2K_INITIAL_DISCOVERY_RETRY_MS)) {
-        return false;
-    }
-
-    n2k_last_initial_discovery_attempt_ms = now_ms;
-    if (n2k_send_request(0xffu,
-                         N2K_PGN_ADDRESS_CLAIM,
-                         now_ms)) {
-        n2k_initial_discovery_request_sent = true;
-        return true;
-    }
-
-    return false;
-}
-
-static bool n2k_request_next_pending_metadata(uint32_t now_ms)
-{
-    bool product_pending = false;
-    bool config_pending = false;
-    bool pgn_list_pending = false;
-
-    if (n2k_ensure_local_address_claim(now_ms, "announce local source before metadata request")) {
-        return true;
-    }
-
-    if ((n2k_model_lock == NULL) || !n2k_request_gap_elapsed(now_ms)) {
-        return false;
-    }
-    if (xSemaphoreTake(n2k_model_lock, portMAX_DELAY) != pdTRUE) {
-        return false;
-    }
-
-    for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-        N2kDeviceEntry_t *entry = &n2k_app_model.devices.entries[i];
-        if (!n2k_is_remote_entry(entry) || !n2k_entry_old_enough_for_request(entry, now_ms)) {
-            continue;
-        }
-        if (!entry->has_address_claim &&
-            (entry->address_claim_request_count < N2K_MAX_INFO_REQUESTS) &&
-            n2k_request_retry_due(now_ms, entry->last_address_claim_request_ms, N2K_INFO_REQUEST_RETRY_MS)) {
-            if (n2k_send_request(entry->source,
-                                 N2K_PGN_ADDRESS_CLAIM,
-                                 now_ms)) {
-                entry->last_address_claim_request_ms = now_ms;
-                entry->address_claim_request_count++;
-                xSemaphoreGive(n2k_model_lock);
-                return true;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-        N2kDeviceEntry_t *entry = &n2k_app_model.devices.entries[i];
-        if (!n2k_is_remote_entry(entry) || !n2k_entry_old_enough_for_request(entry, now_ms)) {
-            continue;
-        }
-        if (!entry->has_product_info && (entry->product_request_count < N2K_MAX_INFO_REQUESTS)) {
-            if (n2k_request_retry_due(now_ms, entry->last_product_request_ms, N2K_INFO_REQUEST_RETRY_MS)) {
-                if (n2k_send_request(entry->source,
-                                     N2K_PGN_PRODUCT_INFO,
-                                     now_ms)) {
-                    entry->last_product_request_ms = now_ms;
-                    entry->product_request_count++;
-                    xSemaphoreGive(n2k_model_lock);
-                    return true;
-                }
-            }
-            product_pending = true;
-        }
-    }
-    if (product_pending) {
-        if (n2k_request_retry_due(now_ms,
-                                  n2k_last_global_product_request_ms,
-                                  N2K_GLOBAL_INFO_REQUEST_RETRY_MS) &&
-            n2k_send_request(0xffu,
-                             N2K_PGN_PRODUCT_INFO,
-                             now_ms)) {
-            n2k_last_global_product_request_ms = now_ms;
-            xSemaphoreGive(n2k_model_lock);
-            return true;
-        }
-        xSemaphoreGive(n2k_model_lock);
-        return false;
-    }
-
-    for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-        N2kDeviceEntry_t *entry = &n2k_app_model.devices.entries[i];
-        if (!n2k_is_remote_entry(entry) || !n2k_entry_old_enough_for_request(entry, now_ms)) {
-            continue;
-        }
-        if (!entry->has_configuration_info && (entry->configuration_request_count < N2K_MAX_INFO_REQUESTS)) {
-            if (n2k_request_retry_due(now_ms, entry->last_configuration_request_ms, N2K_INFO_REQUEST_RETRY_MS)) {
-                if (n2k_send_request(entry->source,
-                                     N2K_PGN_CONFIGURATION_INFO,
-                                     now_ms)) {
-                    entry->last_configuration_request_ms = now_ms;
-                    entry->configuration_request_count++;
-                    xSemaphoreGive(n2k_model_lock);
-                    return true;
-                }
-            }
-            config_pending = true;
-        }
-    }
-    if (config_pending) {
-        if (n2k_request_retry_due(now_ms,
-                                  n2k_last_global_configuration_request_ms,
-                                  N2K_GLOBAL_INFO_REQUEST_RETRY_MS) &&
-            n2k_send_request(0xffu,
-                             N2K_PGN_CONFIGURATION_INFO,
-                             now_ms)) {
-            n2k_last_global_configuration_request_ms = now_ms;
-            xSemaphoreGive(n2k_model_lock);
-            return true;
-        }
-        xSemaphoreGive(n2k_model_lock);
-        return false;
-    }
-
-    for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-        N2kDeviceEntry_t *entry = &n2k_app_model.devices.entries[i];
-        if (!n2k_is_remote_entry(entry) || !n2k_entry_old_enough_for_request(entry, now_ms)) {
-            continue;
-        }
-        if ((!entry->has_tx_pgn_list || !entry->has_rx_pgn_list) &&
-            (entry->pgn_list_request_count < N2K_MAX_PGN_LIST_REQUESTS) &&
-            n2k_request_retry_due(now_ms, entry->last_pgn_list_request_ms, N2K_PGN_LIST_REQUEST_RETRY_MS)) {
-            if (n2k_send_request(entry->source,
-                                 N2K_PGN_SUPPORTED_PGN_LIST,
-                                 now_ms)) {
-                entry->last_pgn_list_request_ms = now_ms;
-                entry->pgn_list_request_count++;
-                xSemaphoreGive(n2k_model_lock);
-                return true;
-            }
-        }
-        if (!entry->has_tx_pgn_list || !entry->has_rx_pgn_list) {
-            pgn_list_pending = true;
-        }
-    }
-
-    if (pgn_list_pending &&
-        n2k_request_retry_due(now_ms,
-                              n2k_last_global_pgn_list_request_ms,
-                              N2K_PGN_LIST_REQUEST_RETRY_MS) &&
-        n2k_send_request(0xffu,
-                         N2K_PGN_SUPPORTED_PGN_LIST,
-                         now_ms)) {
-        n2k_last_global_pgn_list_request_ms = now_ms;
-        xSemaphoreGive(n2k_model_lock);
-        return true;
-    }
-
-    xSemaphoreGive(n2k_model_lock);
-    return false;
-}
-
-static size_t n2k_copy_device_snapshot(N2kDeviceEntry_t *dst, size_t max_count)
-{
-    size_t copied = 0u;
-    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-    if ((dst == NULL) || (max_count == 0u) || (n2k_model_lock == NULL)) {
+    if ((out_buf == NULL) || (frames == NULL) || (frame_count == 0u)) {
         return 0u;
     }
-    if (xSemaphoreTake(n2k_model_lock, portMAX_DELAY) != pdTRUE) {
+    if (frame_count > BLE_NOTIFY_BINARY_MAX_FRAMES) {
+        return 0u;
+    }
+    if (out_buf_size < (BLE_NOTIFY_BINARY_PACKET_HEADER_LEN + (frame_count * BLE_NOTIFY_BINARY_FRAME_LEN))) {
         return 0u;
     }
 
-    {
-        const N2kDeviceEntry_t *entries = n2k_device_manager_entries(&n2k_app_model.devices);
-        if (entries != NULL) {
-            for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES && copied < max_count; i++) {
-                if (!n2k_is_remote_entry(&entries[i])) {
-                    continue;
-                }
-                if (!n2k_entry_seen_within_window(&entries[i], now_ms, N2K_DEVICE_STALE_HIDE_MS)) {
-                    continue;
-                }
-                dst[copied++] = entries[i];
-            }
+    out_buf[offset++] = BLE_NOTIFY_BINARY_PACKET_VERSION;
+    out_buf[offset++] = BLE_NOTIFY_BINARY_PACKET_TYPE_FRAME_BATCH;
+    out_buf[offset++] = (uint8_t)(sequence & 0xFFu);
+    out_buf[offset++] = (uint8_t)((sequence >> 8u) & 0xFFu);
+    out_buf[offset++] = (uint8_t)frame_count;
+    out_buf[offset++] = 0u;
+    out_buf[offset++] = 0u;
+    out_buf[offset++] = 0u;
+
+    for (size_t i = 0u; i < frame_count; i++) {
+        uint8_t dlc = n2k_raw_frame_clamp_dlc(frames[i].dlc);
+
+        out_buf[offset++] = (uint8_t)(frames[i].can_id & 0xFFu);
+        out_buf[offset++] = (uint8_t)((frames[i].can_id >> 8u) & 0xFFu);
+        out_buf[offset++] = (uint8_t)((frames[i].can_id >> 16u) & 0xFFu);
+        out_buf[offset++] = (uint8_t)((frames[i].can_id >> 24u) & 0xFFu);
+        out_buf[offset++] = dlc;
+        out_buf[offset++] = frames[i].flags;
+        memcpy(&out_buf[offset], frames[i].data, N2K_RAW_FRAME_MAX_DATA_LEN);
+        offset += N2K_RAW_FRAME_MAX_DATA_LEN;
+    }
+
+    return offset;
+}
+
+static void ble_notify_protocol_event(const char *fmt, ...) {
+    char line[BLE_NOTIFY_TEXT_MAX_LEN];
+    char notify_line[BLE_NOTIFY_TEXT_MAX_LEN + 1u];
+    va_list args;
+
+    if (fmt == NULL) {
+        return;
+    }
+
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    if (active_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        snprintf(notify_line, sizeof(notify_line), "%s\n", line);
+        (void)gatt_svr_notify_text(active_conn_handle, notify_line);
+    }
+}
+
+static void spi_log_packet_hex(const char *prefix, const uint8_t *data, size_t len) {
+    char line[3u * SPI_N2K_MAX_PACKET_LEN + 1u];
+    size_t max_bytes;
+    size_t pos = 0u;
+
+    if ((prefix == NULL) || (data == NULL)) {
+        return;
+    }
+
+    max_bytes = len;
+    if (max_bytes > SPI_N2K_MAX_PACKET_LEN) {
+        max_bytes = SPI_N2K_MAX_PACKET_LEN;
+    }
+
+    for (size_t i = 0u; i < max_bytes; i++) {
+        if ((pos + 3u) >= sizeof(line)) {
+            break;
         }
+        pos += (size_t)snprintf(&line[pos], sizeof(line) - pos, "%02X ", data[i]);
+    }
+    if (pos > 0u) {
+        line[pos - 1u] = '\0';
+    } else {
+        line[0] = '\0';
     }
 
-    xSemaphoreGive(n2k_model_lock);
-    return copied;
+    ESP_LOGI(tag, "%s type=0x%02X len=%u data=[%s]",
+             prefix,
+             max_bytes >= 3u ? data[2] : 0u,
+             (unsigned)len,
+             line);
 }
 
-static void ble_request_missing_device_metadata(uint32_t *useful_requests_needed,
-                                                uint32_t *optional_pgn_requests_needed)
-{
-    uint32_t useful_needed = 0u;
-    uint32_t optional_needed = 0u;
-
-    if (useful_requests_needed != NULL) {
-        *useful_requests_needed = 0u;
-    }
-    if (optional_pgn_requests_needed != NULL) {
-        *optional_pgn_requests_needed = 0u;
-    }
-    n2k_last_global_product_request_ms = 0u;
-    n2k_last_global_configuration_request_ms = 0u;
-    n2k_last_global_pgn_list_request_ms = 0u;
-    n2k_initial_discovery_request_sent = false;
-    n2k_last_initial_discovery_attempt_ms = 0u;
-
-    if ((n2k_model_lock == NULL) || (xSemaphoreTake(n2k_model_lock, portMAX_DELAY) != pdTRUE)) {
-        return;
-    }
-
-    {
-        N2kDeviceEntry_t *entries = n2k_app_model.devices.entries;
-        if (entries != NULL) {
-            for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-                if (!n2k_is_remote_entry(&entries[i])) {
-                    continue;
-                }
-                if (!entries[i].has_address_claim) {
-                    useful_needed++;
-                    entries[i].last_address_claim_request_ms = 0u;
-                    entries[i].address_claim_request_count = 0u;
-                }
-                if (!entries[i].has_product_info) {
-                    useful_needed++;
-                    entries[i].last_product_request_ms = 0u;
-                    entries[i].product_request_count = 0u;
-                }
-                if (!entries[i].has_configuration_info) {
-                    useful_needed++;
-                    entries[i].last_configuration_request_ms = 0u;
-                    entries[i].configuration_request_count = 0u;
-                }
-                if (!entries[i].has_tx_pgn_list || !entries[i].has_rx_pgn_list) {
-                    optional_needed++;
-                    entries[i].last_pgn_list_request_ms = 0u;
-                    entries[i].pgn_list_request_count = 0u;
-                }
-            }
-        }
-    }
-
-    xSemaphoreGive(n2k_model_lock);
-    if (useful_requests_needed != NULL) {
-        *useful_requests_needed = useful_needed;
-    }
-    if (optional_pgn_requests_needed != NULL) {
-        *optional_pgn_requests_needed = optional_needed;
-    }
-}
-
-static void ble_add_gateway_device_json(cJSON *devices)
-{
-    cJSON *device;
-    cJSON *supported_pgns;
-
-    if (devices == NULL) {
-        return;
-    }
-
-    device = cJSON_CreateObject();
-    supported_pgns = cJSON_CreateArray();
-    if ((device == NULL) || (supported_pgns == NULL)) {
-        cJSON_Delete(device);
-        cJSON_Delete(supported_pgns);
-        return;
-    }
-
-    cJSON_AddNumberToObject(device, "src", N2K_LOCAL_SOURCE);
-    cJSON_AddStringToObject(device, "name", N2K_GATEWAY_DEVICE_NAME);
-    cJSON_AddStringToObject(device, "model", N2K_GATEWAY_MODEL_NAME);
-    cJSON_AddStringToObject(device, "manufacturer", "Manufacturer code 2046");
-    cJSON_AddStringToObject(device, "category", N2K_GATEWAY_CATEGORY);
-    cJSON_AddBoolToObject(device, "online", true);
-    cJSON_AddNullToObject(device, "lastSeen");
-    cJSON_AddBoolToObject(device, "hasAddressClaim", n2k_local_address_claim_sent);
-    cJSON_AddBoolToObject(device, "hasProductInfo", false);
-    cJSON_AddBoolToObject(device, "hasConfigurationInfo", false);
-    cJSON_AddBoolToObject(device, "hasTxPgnList", false);
-    cJSON_AddBoolToObject(device, "hasRxPgnList", false);
-    cJSON_AddBoolToObject(device, "isGateway", true);
-    cJSON_AddItemToObject(device, "supportedPgns", supported_pgns);
-    cJSON_AddItemToArray(devices, device);
-}
-
-/* Large JSON responses are split across notify packets; the app should reassemble bytes until '\n'. */
-static int ble_send_device_list_response(uint16_t conn_handle)
-{
-    size_t snapshot_bytes = sizeof(N2kDeviceEntry_t) * N2K_DEVICE_MANAGER_MAX_DEVICES;
-    N2kDeviceEntry_t *snapshot = NULL;
-    size_t device_count = 0u;
-    uint8_t live_wind_source = 0xFFu;
-    bool live_wind_source_valid = false;
-    cJSON *root = NULL;
-    cJSON *devices = NULL;
-    char *json_text;
-    char *framed_text;
+static void ble_publish_device_list_snapshot(void) {
+    uint32_t now_ms;
+    uint32_t ref_ms;
     int rc;
 
-    snapshot = (N2kDeviceEntry_t *)malloc(snapshot_bytes);
-    if (snapshot == NULL) {
-        ESP_LOGE(tag, "BLE device_list snapshot allocation failed: bytes=%u", (unsigned)snapshot_bytes);
-        return BLE_HS_ENOMEM;
+    if (active_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        return;
     }
 
-    device_count = n2k_copy_device_snapshot(snapshot, N2K_DEVICE_MANAGER_MAX_DEVICES);
-    root = cJSON_CreateObject();
-    devices = cJSON_CreateArray();
+    now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
-    if ((root == NULL) || (devices == NULL)) {
-        cJSON_Delete(root);
-        cJSON_Delete(devices);
-        ESP_LOGE(tag, "BLE device_list build failed: out of memory");
-        free(snapshot);
-        return BLE_HS_ENOMEM;
+    /* Use the snapshot's own last-update timestamp as the age reference so that
+       the stale filter measures age relative to when the data was captured, not
+       when it is published.  This prevents the timeout path (which fires
+       seconds after the last device record arrived) from hiding every device. */
+    ref_ms = n2k_app_model.device_list.last_update_ms;
+    if (ref_ms == 0u) {
+        ref_ms = now_ms;
     }
 
-    cJSON_AddStringToObject(root, "type", "device_list");
-    cJSON_AddItemToObject(root, "devices", devices);
-    ble_add_gateway_device_json(devices);
-    live_wind_source_valid = n2k_get_live_wind_source(&live_wind_source);
+    rc = ble_text_send_snapshot(active_conn_handle,
+                                &n2k_app_model,
+                                N2K_LOCAL_SOURCE,
+                                ref_ms,
+                                BLE_DEVICE_LIST_REFRESH_WINDOW_MS,
+                                BLE_DEVICE_LIST_REFRESH_MAX_WINDOW_MS);
+    if (rc != 0) {
+        ESP_LOGW(tag, "device-list snapshot notify failed, rc=%d", rc);
+    }
+}
 
-    for (size_t i = 0; i < device_count; i++) {
-        cJSON *device = cJSON_CreateObject();
-        cJSON *supported_pgns = cJSON_CreateArray();
-        const char *name_source = NULL;
-        const char *model_source = NULL;
-        const char *manufacturer_source = NULL;
-        const char *category_source = NULL;
-        const char *name;
-        const char *model;
-        const char *manufacturer_text;
-        const char *category;
-        bool has_last_seen;
-        bool is_online;
+static bool spi_send_device_list_request(void) {
+    uint8_t payload[9];
+    uint8_t packet[SPI_N2K_MAX_PACKET_LEN];
+    size_t packet_len = 0u;
+    uint16_t request_id;
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 
-        if ((device == NULL) || (supported_pgns == NULL)) {
-            cJSON_Delete(root);
-            ESP_LOGE(tag, "BLE device_list build failed while creating device JSON");
-            free(snapshot);
-            return BLE_HS_ENOMEM;
-        }
-
-        name = n2k_best_device_name(&snapshot[i],
-                                    ble_device_list_meta_scratch.name_buf,
-                                    sizeof(ble_device_list_meta_scratch.name_buf),
-                                    &name_source);
-        model = n2k_best_model(&snapshot[i],
-                               ble_device_list_meta_scratch.model_buf,
-                               sizeof(ble_device_list_meta_scratch.model_buf),
-                               &model_source);
-        manufacturer_text = n2k_best_manufacturer(&snapshot[i],
-                                                  ble_device_list_meta_scratch.manufacturer_buf,
-                                                  sizeof(ble_device_list_meta_scratch.manufacturer_buf),
-                                                  &manufacturer_source);
-        category = n2k_guess_category(&snapshot[i], &category_source);
-        has_last_seen = n2k_format_last_seen_utc(&snapshot[i],
-                                                 ble_device_list_meta_scratch.last_seen_buf,
-                                                 sizeof(ble_device_list_meta_scratch.last_seen_buf));
-        is_online = n2k_entry_seen_within_window(&snapshot[i],
-                             (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
-                             N2K_DEVICE_ONLINE_MS);
-        cJSON_AddNumberToObject(device, "src", snapshot[i].source);
-        cJSON_AddStringToObject(device, "name", name);
-        cJSON_AddStringToObject(device, "model", model);
-        cJSON_AddStringToObject(device, "manufacturer", manufacturer_text);
-        cJSON_AddStringToObject(device, "category", category);
-        cJSON_AddBoolToObject(device, "online", is_online);
-        if (has_last_seen) {
-            cJSON_AddStringToObject(device, "lastSeen", ble_device_list_meta_scratch.last_seen_buf);
-        } else {
-            cJSON_AddNullToObject(device, "lastSeen");
-        }
-        cJSON_AddBoolToObject(device, "hasAddressClaim", snapshot[i].has_address_claim);
-        cJSON_AddBoolToObject(device, "hasProductInfo", snapshot[i].has_product_info);
-        cJSON_AddBoolToObject(device, "hasConfigurationInfo", snapshot[i].has_configuration_info);
-        cJSON_AddBoolToObject(device, "hasTxPgnList", snapshot[i].has_tx_pgn_list);
-        cJSON_AddBoolToObject(device, "hasRxPgnList", snapshot[i].has_rx_pgn_list);
-        cJSON_AddBoolToObject(device,
-                              "hasLiveWindData",
-                              live_wind_source_valid && (snapshot[i].source == live_wind_source));
-        if (n2k_text_available(snapshot[i].serial_code)) {
-            cJSON_AddStringToObject(device, "serialNumber", snapshot[i].serial_code);
-        }
-        if (n2k_text_available(snapshot[i].software_version)) {
-            cJSON_AddStringToObject(device, "softwareVersion", snapshot[i].software_version);
-        }
-        if (n2k_text_available(snapshot[i].model)) {
-            cJSON_AddStringToObject(device, "modelVersion", snapshot[i].model);
-        }
-        if (n2k_text_available(snapshot[i].manufacturer_text)) {
-            cJSON_AddStringToObject(device, "manufacturerText", snapshot[i].manufacturer_text);
-        }
-        if (n2k_text_available(snapshot[i].installation_desc1)) {
-            cJSON_AddStringToObject(device, "installationDescription1", snapshot[i].installation_desc1);
-        }
-        if (n2k_text_available(snapshot[i].installation_desc2)) {
-            cJSON_AddStringToObject(device, "installationDescription2", snapshot[i].installation_desc2);
-        }
-        n2k_add_supported_pgns_json(supported_pgns, &snapshot[i]);
-        cJSON_AddItemToObject(device, "supportedPgns", supported_pgns);
-        cJSON_AddItemToArray(devices, device);
+    if (!device_list_build_request_payload(&device_list_request_state,
+                                           now_ms,
+                                           DEVICE_LIST_PROTOCOL_VERSION,
+                                           DEVICE_LIST_REQUEST_SRC,
+                                           DEVICE_LIST_REQUEST_DST,
+                                           DEVICE_LIST_REQUEST_PGN,
+                                           payload,
+                                           sizeof(payload),
+                                           &request_id)) {
+        ESP_LOGE(tag, "DEVICE_LIST_REQUEST state/payload build failed");
+        return false;
     }
 
-    json_text = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (json_text == NULL) {
-        ESP_LOGE(tag, "BLE device_list serialization failed");
-        free(snapshot);
-        return BLE_HS_ENOMEM;
+    if (!spi_n2k_transport_build_custom_packet(SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST,
+                                                payload,
+                                                sizeof(payload),
+                                                packet,
+                                                sizeof(packet),
+                                                &packet_len)) {
+        ESP_LOGE(tag, "DEVICE_LIST_REQUEST build failed");
+        return false;
+    }
+    if (!spi_enqueue_custom_packet(packet, packet_len)) {
+        ESP_LOGW(tag, "DEVICE_LIST_REQUEST queue full");
+        return false;
     }
 
-    framed_text = (char *)malloc(strlen(json_text) + 2u);
-    if (framed_text == NULL) {
-        cJSON_free(json_text);
-        ESP_LOGE(tag, "BLE device_list framing failed");
-        free(snapshot);
-        return BLE_HS_ENOMEM;
-    }
+    spi_log_packet_hex("SPI TX", packet, packet_len);
+    ESP_LOGI(tag, "device-list request sent: request_id=%u src=%u dst=%u pgn=%lu",
+             (unsigned)request_id,
+             (unsigned)DEVICE_LIST_REQUEST_SRC,
+             (unsigned)DEVICE_LIST_REQUEST_DST,
+             (unsigned long)DEVICE_LIST_REQUEST_PGN);
 
-    snprintf(framed_text, strlen(json_text) + 2u, "%s\n", json_text);
-    ESP_LOGI(tag, "BLE sending device_list: devices=%u json_len=%u",
-             (unsigned)device_count,
-             (unsigned)strlen(json_text));
-    rc = gatt_svr_notify_text_chunks(conn_handle, framed_text);
-    ESP_LOGI(tag, "BLE device_list send %s, rc=%d",
-             rc == 0 ? "succeeded" : "failed",
-             rc);
-
-    free(snapshot);
-    free(framed_text);
-    cJSON_free(json_text);
-    return rc;
+    ble_notify_protocol_event("device_list request sent id=%u", (unsigned)request_id);
+    return true;
 }
 
 static void ble_handle_command_line(const char *command_line, void *ctx)
 {
-    cJSON *root;
-    cJSON *command;
-    const char *parsed_command = NULL;
     (void)ctx;
 
     if (command_line == NULL) {
@@ -1088,123 +341,34 @@ static void ble_handle_command_line(const char *command_line, void *ctx)
         return;
     }
 
-    root = cJSON_Parse(command_line);
-    if (root == NULL) {
-        ESP_LOGW(tag, "BLE command parse failed: invalid JSON");
-        return;
-    }
-
-    command = cJSON_GetObjectItemCaseSensitive(root, "command");
-    if (!cJSON_IsString(command) || (command->valuestring == NULL)) {
-        ESP_LOGW(tag, "BLE command parse failed: missing command");
-        cJSON_Delete(root);
-        return;
-    }
-
-    parsed_command = command->valuestring;
-    if (strcmp(parsed_command, "request_device_list") == 0) {
+    if (ble_text_command_is_request_device_list(command_line)) {
         ble_device_list_request_pending = true;
+        ESP_LOGI(tag, "BLE command request_device_list accepted");
     } else {
-        ESP_LOGW(tag, "BLE command ignored: unsupported command '%s'", parsed_command);
+        ESP_LOGW(tag, "BLE command ignored: unsupported command '%s'", command_line);
     }
-
-    cJSON_Delete(root);
 }
 
 void ble_store_config_init(void);
 
-static void n2k_set_latest_text(const char *text)
-{
-    if (text == NULL || n2k_text_lock == NULL) {
-        return;
-    }
-
-    if (xSemaphoreTake(n2k_text_lock, portMAX_DELAY) == pdTRUE) {
-        snprintf(latest_n2k_text, sizeof(latest_n2k_text), "%s", text);
-        latest_n2k_seq++;
-        xSemaphoreGive(n2k_text_lock);
-    }
-}
-
-static bool n2k_enqueue_tx_frame(const N2K_RawFrame_t *frame, void *ctx) {
-    QueueHandle_t queue = (QueueHandle_t)ctx;
-    if ((queue == NULL) || (frame == NULL)) {
-        return false;
-    }
-    return xQueueSend(queue, frame, 0) == pdTRUE;
-}
-
-static void n2k_update_latest_text_from_model(void) {
-    char line[180];
-    char wind_text[40];
-    char heading_text[24];
-    char gps_text[40];
-    char battery_text[40];
-    size_t device_count = n2k_device_manager_count(&n2k_app_model.devices);
-    const char *model_name = "n/a";
-    const N2kDeviceEntry_t *entries = n2k_device_manager_entries(&n2k_app_model.devices);
-
-    if (entries != NULL) {
-        for (size_t i = 0; i < N2K_DEVICE_MANAGER_MAX_DEVICES; i++) {
-            if (entries[i].used && entries[i].model[0] != '\0') {
-                model_name = entries[i].model;
-                break;
-            }
-        }
-    }
-
-    if (n2k_app_model.wind.valid) {
-        snprintf(wind_text, sizeof(wind_text), "spd=%.2f,ang=%.1f,ref=%u",
-                 n2k_app_model.wind.speed_mps,
-                 n2k_app_model.wind.angle_deg,
-                 (unsigned)n2k_app_model.wind.reference);
-    } else {
-        snprintf(wind_text, sizeof(wind_text), "-");
-    }
-
-    if (n2k_app_model.heading.valid) {
-        snprintf(heading_text, sizeof(heading_text), "%.1fdeg",
-                 n2k_app_model.heading.heading_deg);
-    } else {
-        snprintf(heading_text, sizeof(heading_text), "-");
-    }
-
-    if (n2k_app_model.position.valid) {
-        snprintf(gps_text, sizeof(gps_text), "%.5f,%.5f",
-                 n2k_app_model.position.latitude_deg,
-                 n2k_app_model.position.longitude_deg);
-    } else {
-        snprintf(gps_text, sizeof(gps_text), "-");
-    }
-
-    if (n2k_app_model.battery.valid) {
-        snprintf(battery_text, sizeof(battery_text), "%.2fV/%.2fA/%.1fC",
-                 n2k_app_model.battery.voltage_v,
-                 n2k_app_model.battery.current_a,
-                 n2k_app_model.battery.temperature_c);
-    } else {
-        snprintf(battery_text, sizeof(battery_text), "-");
-    }
-
-    snprintf(line, sizeof(line),
-             "dev:%u wind:%.24s hdg:%.12s gps:%.24s bat:%.24s unknown:%lu model:%.20s",
-             (unsigned)device_count,
-             wind_text,
-             heading_text,
-             gps_text,
-             battery_text,
-             (unsigned long)n2k_app_model.unknown_pgn_count,
-             model_name);
-    n2k_set_latest_text(line);
-}
-
 static void spi_n2k_task(void *param) {
     (void)param;
-    SpiN2kTransportParser_t parser;
     TickType_t last_stats_log = xTaskGetTickCount();
-    uint8_t tx_buf[SPI_RX_BUF_SIZE];
-    WORD_ALIGNED_ATTR static uint8_t rx_buf[SPI_RX_BUF_SIZE];
-    N2K_RawFrame_t tx_frame;
+    static SpiN2kTransportParser_t parser;
+    /* Two ping-pong buffer pairs so the SPI DMA can be armed with the NEXT
+     * transaction before we start processing the previous one.  This ensures
+     * the hardware never misses a CS pulse because we were busy elsewhere
+     * (e.g. sending a BLE notification).  This is the pattern recommended by
+     * the ESP-IDF spi_slave documentation:
+     * https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/spi_slave.html */
+    WORD_ALIGNED_ATTR static uint8_t tx_buf[2][SPI_RX_BUF_SIZE];
+    WORD_ALIGNED_ATTR static uint8_t rx_buf[2][SPI_RX_BUF_SIZE];
+    static spi_slave_transaction_t trans[2];
+    static SpiQueuedPacket_t tx_custom;
+    static SpiN2kPacket_t packet;
+    static uint8_t log_packet[SPI_N2K_MAX_PACKET_LEN];
+    static N2K_RawFrame_t frame;
+    static N2kDeviceEntry_t entry;
 
     spi_bus_config_t buscfg = {
         .mosi_io_num = PIN_NUM_MOSI,
@@ -1218,7 +382,7 @@ static void spi_n2k_task(void *param) {
     spi_slave_interface_config_t slvcfg = {
         .spics_io_num = PIN_NUM_CS,
         .flags = 0,
-        .queue_size = 1,
+        .queue_size = 2,   /* must be >= 2 for double-buffering */
         .mode = 0,
     };
 
@@ -1227,41 +391,274 @@ static void spi_n2k_task(void *param) {
     ESP_LOGI(tag, "SPI slave ready (MOSI=%d MISO=%d SCLK=%d CS=%d)",
              PIN_NUM_MOSI, PIN_NUM_MISO, PIN_NUM_SCLK, PIN_NUM_CS);
 
-    while (1) {
-        spi_slave_transaction_t trans;
-        memset(rx_buf, 0, sizeof(rx_buf));
-        memset(tx_buf, 0xFF, sizeof(tx_buf));
+    /* Prime the queue: arm slot 0 so there is always one transaction waiting
+     * for the master before we enter the main loop. */
+    memset(rx_buf[0], 0, SPI_RX_BUF_SIZE);
+    memset(tx_buf[0], 0xFF, SPI_RX_BUF_SIZE);
+    memset(&trans[0], 0, sizeof(trans[0]));
+    trans[0].length    = SPI_RX_BUF_SIZE * 8;
+    trans[0].rx_buffer = rx_buf[0];
+    trans[0].tx_buffer = tx_buf[0];
+    ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_SLAVE_HOST, &trans[0], portMAX_DELAY));
 
-        if (xQueueReceive(n2k_tx_queue, &tx_frame, 0) == pdTRUE) {
-            size_t packet_len = 0u;
-            (void)spi_n2k_transport_build_frame_packet(SPI_N2K_PKT_TYPE_N2K_TX_FRAME, &tx_frame, tx_buf, sizeof(tx_buf), &packet_len);
+    int slot = 1; /* the slot we are about to arm next */
+
+    while (1) {
+        spi_slave_transaction_t *completed = NULL;
+
+        /* ── Arm the NEXT slot before blocking for the previous result ── */
+        memset(rx_buf[slot], 0, SPI_RX_BUF_SIZE);
+        memset(tx_buf[slot], 0xFF, SPI_RX_BUF_SIZE);
+
+        /* Fill the outbound tx buffer for this slot if a custom packet is
+         * pending (device-list request, etc.). */
+        if (ble_device_list_request_pending) {
+            ble_device_list_request_pending = false;
+            (void)spi_send_device_list_request();
+        }
+        if (xQueueReceive(spi_custom_tx_queue, &tx_custom, 0) == pdTRUE) {
+            memcpy(tx_buf[slot], tx_custom.data, tx_custom.len);
+            spi_log_packet_hex("SPI TX", tx_custom.data, tx_custom.len);
         }
 
-        memset(&trans, 0, sizeof(trans));
-        trans.length = SPI_RX_BUF_SIZE * 8;
-        trans.rx_buffer = rx_buf;
-        trans.tx_buffer = tx_buf;
+        memset(&trans[slot], 0, sizeof(trans[slot]));
+        trans[slot].length    = SPI_RX_BUF_SIZE * 8;
+        trans[slot].rx_buffer = rx_buf[slot];
+        trans[slot].tx_buffer = tx_buf[slot];
 
-        if (spi_slave_transmit(SPI_SLAVE_HOST, &trans, portMAX_DELAY) != ESP_OK) {
+        /* Queue the next slot — the HW is now armed and will capture the very
+         * next CS pulse regardless of how long we take below. */
+        ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_SLAVE_HOST, &trans[slot], portMAX_DELAY));
+
+        /* Flip to the other slot for the next iteration. */
+        slot ^= 1;
+
+        /* ── Now block until the previously-queued transaction completes ── */
+        if (spi_slave_get_trans_result(SPI_SLAVE_HOST, &completed, portMAX_DELAY) != ESP_OK) {
             continue;
         }
 
-        int rx_len_bytes = trans.trans_len / 8;
+        int rx_len_bytes = (int)(completed->trans_len / 8);
+        uint8_t *rx = (uint8_t *)completed->rx_buffer;
+
         for (int i = 0; i < rx_len_bytes; i++) {
-            SpiN2kPacket_t packet;
-            if (spi_n2k_transport_parser_consume_byte(&parser, rx_buf[i], &packet)) {
+            if (spi_n2k_transport_parser_consume_byte(&parser, rx[i], &packet)) {
+
+                /* Log raw hex only for device-list packets — N2K frame spam is suppressed. */
+                if ((packet.pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST) ||
+                    (packet.pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST)) {
+                    size_t log_len = 0u;
+                    if (spi_n2k_transport_build_custom_packet(packet.pkt_type,
+                                                              packet.payload,
+                                                              packet.payload_len,
+                                                              log_packet,
+                                                              sizeof(log_packet),
+                                                              &log_len)) {
+                        spi_log_packet_hex("SPI RX", log_packet, log_len);
+                    }
+                }
+
                 if (packet.pkt_type == SPI_N2K_PKT_TYPE_N2K_RX_FRAME) {
-                    N2K_RawFrame_t frame;
                     if (spi_n2k_transport_parse_frame_payload(&packet, &frame)) {
                         frame.flags |= N2K_RAW_FLAG_DIRECTION_RX;
-                        if ((n2k_model_lock != NULL) &&
-                            (xSemaphoreTake(n2k_model_lock, portMAX_DELAY) == pdTRUE)) {
-                            n2k_decoder_process_frame(&n2k_decoder, &frame);
-                            n2k_update_latest_text_from_model();
-                            xSemaphoreGive(n2k_model_lock);
+                        n2k_app_model_store_raw(&n2k_app_model, &frame);
+                        ble_queue_binary_frame(&frame);
+                    }
+                } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST) {
+                    DeviceListBridgeEvent_t event;
+                    DeviceListPacketHeader_t header;
+                    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+
+                    (void)device_list_parse_packet_event(&device_list_request_state,
+                                                         now_ms,
+                                                         &packet,
+                                                         DEVICE_LIST_PROTOCOL_VERSION,
+                                                         &event);
+
+                    if (!device_list_parse_packet_header(&packet,
+                                                         DEVICE_LIST_PROTOCOL_VERSION,
+                                                         &header)) {
+                        ESP_LOGW(tag, "[DEVLIST] ERROR malformed header pkt_type=0x%02X payload_len=%u",
+                                 (unsigned)packet.pkt_type, (unsigned)packet.payload_len);
+                        n2k_app_model_mark_device_list_malformed(&n2k_app_model);
+                    } else if (header.message_type == DEVICE_LIST_BRIDGE_EVENT_BEGIN) {
+                        uint8_t own_source = 0u;
+                        uint8_t expected_count = 0u;
+
+                        if (!device_list_parse_snapshot_begin(&packet,
+                                                              DEVICE_LIST_PROTOCOL_VERSION,
+                                                              &header,
+                                                              &own_source,
+                                                              &expected_count)) {
+                            ESP_LOGW(tag, "[DEVLIST] ERROR parse BEGIN failed id=%u",
+                                     (unsigned)header.request_id);
+                            n2k_app_model_mark_device_list_malformed(&n2k_app_model);
+                        } else if (!n2k_app_model_device_list_begin(&n2k_app_model,
+                                                                     header.request_id,
+                                                                     header.snapshot_time_ms,
+                                                                     own_source,
+                                                                     expected_count,
+                                                                     now_ms)) {
+                            ESP_LOGW(tag, "[DEVLIST] BEGIN id=%u rejected by model (stale/duplicate?)",
+                                     (unsigned)header.request_id);
+                        } else {
+                            ESP_LOGI(tag, "[DEVLIST] BEGIN id=%u own_src=%u expected=%u snapshot_ms=%lu",
+                                     (unsigned)header.request_id,
+                                     (unsigned)own_source,
+                                     (unsigned)expected_count,
+                                     (unsigned long)header.snapshot_time_ms);
+                            ble_notify_protocol_event("device_list begin id=%u count=%u",
+                                                      (unsigned)header.request_id,
+                                                      (unsigned)expected_count);
+                        }
+                    } else if (header.message_type == DEVICE_LIST_BRIDGE_EVENT_DEVICE) {
+                        uint8_t record_index = 0u;
+                        uint8_t total_records = 0u;
+
+                        if (!device_list_parse_snapshot_device(&packet,
+                                                               DEVICE_LIST_PROTOCOL_VERSION,
+                                                               &header,
+                                                               &record_index,
+                                                               &total_records,
+                                                               &entry)) {
+                            ESP_LOGW(tag, "[DEVLIST] ERROR parse DEVICE failed id=%u",
+                                     (unsigned)header.request_id);
+                            n2k_app_model_mark_device_list_malformed(&n2k_app_model);
+                        } else if (!n2k_app_model_device_list_add_device(&n2k_app_model,
+                                                                          header.request_id,
+                                                                          record_index,
+                                                                          total_records,
+                                                                          &entry,
+                                                                          now_ms)) {
+                            ESP_LOGW(tag, "[DEVLIST] DEVICE %u/%u src=%u rejected by model",
+                                     (unsigned)(record_index + 1u),
+                                     (unsigned)total_records,
+                                     (unsigned)entry.source);
+                        } else {
+                            ESP_LOGI(tag, "[DEVLIST] DEVICE %u/%u src=%u mfg=%u prod=%u class=%u fn=%u model_id='%s' model='%s'",
+                                     (unsigned)(record_index + 1u),
+                                     (unsigned)total_records,
+                                     (unsigned)entry.source,
+                                     (unsigned)entry.manufacturer_code,
+                                     (unsigned)entry.product_code,
+                                     (unsigned)entry.device_class,
+                                     (unsigned)entry.device_function,
+                                     entry.model_id[0] ? entry.model_id : "(empty)",
+                                     entry.model[0] ? entry.model : "(empty)");
+                            ESP_LOGI(tag, "[DEVLIST] DEVICE %u/%u src=%u has_addr=%d has_prod=%d has_cfg=%d has_tx_pgn=%d(%u) has_rx_pgn=%d(%u) sw='%s' serial='%s'",
+                                     (unsigned)(record_index + 1u),
+                                     (unsigned)total_records,
+                                     (unsigned)entry.source,
+                                     entry.has_address_claim ? 1 : 0,
+                                     entry.has_product_info ? 1 : 0,
+                                     entry.has_configuration_info ? 1 : 0,
+                                     entry.has_tx_pgn_list ? 1 : 0,
+                                     (unsigned)entry.tx_pgn_count,
+                                     entry.has_rx_pgn_list ? 1 : 0,
+                                     (unsigned)entry.rx_pgn_count,
+                                     entry.software_version[0] ? entry.software_version : "(empty)",
+                                     entry.serial_code[0] ? entry.serial_code : "(empty)");
+                            ble_notify_protocol_event("device_list device %u/%u src=%u",
+                                                      (unsigned)(record_index + 1u),
+                                                      (unsigned)total_records,
+                                                      (unsigned)entry.source);
+
+                            /* Publish as soon as the last Device record arrives.
+                               The STM32 End binary often races the ESP32 timeout
+                               and the app should not wait 8 seconds for data it
+                               already has.  If the End binary arrives later it
+                               will trigger a second publish with complete=1, which
+                               the app handles gracefully. */
+                            if ((record_index + 1u) >= total_records) {
+                                ESP_LOGI(tag, "[DEVLIST] last record %u/%u received — publishing BLE snapshot early",
+                                         (unsigned)(record_index + 1u),
+                                         (unsigned)total_records);
+                                ble_publish_device_list_snapshot();
+                            }
+                        }
+                    } else if (header.message_type == DEVICE_LIST_BRIDGE_EVENT_COMPLETE) {
+                        uint8_t end_count = 0u;
+                        uint8_t final_count = 0u;
+
+                        if (!device_list_parse_snapshot_end(&packet,
+                                                            DEVICE_LIST_PROTOCOL_VERSION,
+                                                            &header,
+                                                            &end_count)) {
+                            ESP_LOGW(tag, "[DEVLIST] ERROR parse COMPLETE failed id=%u",
+                                     (unsigned)header.request_id);
+                            n2k_app_model_mark_device_list_malformed(&n2k_app_model);
+                        } else if (!n2k_app_model_device_list_end(&n2k_app_model,
+                                                                   header.request_id,
+                                                                   end_count,
+                                                                   now_ms,
+                                                                   &final_count)) {
+                            ESP_LOGW(tag, "[DEVLIST] COMPLETE id=%u end_count=%u rejected by model",
+                                     (unsigned)header.request_id,
+                                     (unsigned)end_count);
+                        } else {
+                            ESP_LOGI(tag, "[DEVLIST] COMPLETE id=%u end_count=%u final=%u -> publishing BLE snapshot",
+                                     (unsigned)header.request_id,
+                                     (unsigned)end_count,
+                                     (unsigned)final_count);
+                            ble_publish_device_list_snapshot();
+                            ble_notify_protocol_event("device_list complete id=%u devices=%u",
+                                                      (unsigned)header.request_id,
+                                                      (unsigned)final_count);
+                        }
+                    }
+                } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_STATUS) {
+                    ESP_LOGI(tag, "SPI RX status payload_len=%u", (unsigned)packet.payload_len);
+                } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_BOAT_STATE) {
+                    /* Forward boat-state (averages + VMG) over BLE binary
+                     * characteristic.  Packet format:
+                     *   Byte 0:    version = 1
+                     *   Byte 1:    type    = 2 (BOAT_STATE)
+                     *   Bytes 2-3: sequence (uint16 LE)
+                     *   Bytes 4-31: 28-byte payload (7 × float32 LE) */
+                    if ((active_conn_handle != BLE_HS_CONN_HANDLE_NONE) &&
+                        (packet.payload_len == BLE_BOAT_STATE_PAYLOAD_LEN)) {
+                        uint8_t bs_pkt[BLE_BOAT_STATE_PACKET_LEN];
+                        bs_pkt[0] = BLE_NOTIFY_BINARY_PACKET_VERSION;
+                        bs_pkt[1] = BLE_NOTIFY_BINARY_PACKET_TYPE_BOAT_STATE;
+                        bs_pkt[2] = (uint8_t)(ble_binary_packet_sequence & 0xFFu);
+                        bs_pkt[3] = (uint8_t)((ble_binary_packet_sequence >> 8u) & 0xFFu);
+                        ble_binary_packet_sequence++;
+                        memcpy(&bs_pkt[4], packet.payload, BLE_BOAT_STATE_PAYLOAD_LEN);
+                        int rc = gatt_svr_notify_binary(active_conn_handle,
+                                                        bs_pkt,
+                                                        (uint16_t)sizeof(bs_pkt));
+                        if (rc != 0) {
+                            ESP_LOGW(tag, "boat_state BLE notify failed rc=%d", rc);
                         }
                     }
                 }
+            }
+        }
+
+        n2k_app_model_note_spi_parser_stats(&n2k_app_model,
+                                            parser.stats.bad_sof,
+                                            parser.stats.bad_len,
+                                            parser.stats.bad_crc,
+                                            parser.stats.unknown_type);
+
+        {
+            uint16_t timed_out_request_id = 0u;
+            uint16_t dropped_request_id = 0u;
+            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+            if (device_list_take_timeout(&device_list_request_state,
+                                         now_ms,
+                                         DEVICE_LIST_SNAPSHOT_TIMEOUT_MS,
+                                         &timed_out_request_id)) {
+                if (n2k_app_model_device_list_timeout_check(&n2k_app_model,
+                                                            now_ms,
+                                                            DEVICE_LIST_SNAPSHOT_TIMEOUT_MS,
+                                                            &dropped_request_id)) {
+                    ble_publish_device_list_snapshot();
+                }
+                if ((timed_out_request_id == 0u) && (dropped_request_id != 0u)) {
+                    timed_out_request_id = dropped_request_id;
+                }
+                ble_notify_protocol_event("device_list timeout id=%u", (unsigned)timed_out_request_id);
             }
         }
 
@@ -1279,96 +676,53 @@ static void spi_n2k_task(void *param) {
     }
 }
 
-static void n2k_request_task(void *param) {
-    (void)param;
-    while (1) {
-        uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-        bool refresh_needed = ble_device_list_request_pending || ble_device_list_refresh_active;
-
-        if (!refresh_needed) {
-            vTaskDelay(pdMS_TO_TICKS(BLE_NOTIFY_TASK_IDLE_DELAY_MS));
-            continue;
-        }
-
-        if (!n2k_request_initial_discovery_if_needed(now_ms)) {
-            (void)n2k_request_next_pending_metadata(now_ms);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(BLE_NOTIFY_TASK_REFRESH_POLL_MS));
-    }
-}
-
 static void
 ble_test_notify_task(void *param)
 {
-    uint32_t last_sent_seq = 0;
+    uint8_t binary_packet[BLE_NOTIFY_BINARY_MAX_LEN];
+    N2K_RawFrame_t binary_frames[BLE_NOTIFY_BINARY_MAX_FRAMES];
     int rc;
     (void)param;
 
     while (1) {
-        TickType_t loop_delay = pdMS_TO_TICKS(BLE_NOTIFY_TASK_IDLE_DELAY_MS);
-        if (active_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            bool has_new = false;
-            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-            if (ble_device_list_request_pending && !ble_device_list_refresh_active) {
-                uint32_t useful_requests_needed = 0u;
-                uint32_t optional_pgn_requests_needed = 0u;
-                ble_device_list_request_pending = false;
-                ble_request_missing_device_metadata(&useful_requests_needed, &optional_pgn_requests_needed);
-                if (n2k_request_gap_elapsed(now_ms) &&
-                    n2k_send_request(0xffu,
-                                     N2K_PGN_ADDRESS_CLAIM,
-                                     now_ms)) {
-                }
-
-                ble_device_list_refresh_active = true;
-                ble_device_list_refresh_start_ms = now_ms;
-            }
-
-            if (ble_device_list_refresh_active) {
-                size_t useful_incomplete_devices = 0u;
-                loop_delay = pdMS_TO_TICKS(BLE_NOTIFY_TASK_REFRESH_POLL_MS);
-                n2k_collect_refresh_status(NULL,
-                                           &useful_incomplete_devices,
-                                           NULL);
-                if ((uint32_t)(now_ms - ble_device_list_refresh_start_ms) >= BLE_DEVICE_LIST_REFRESH_WINDOW_MS) {
-                    if ((useful_incomplete_devices > 0u) &&
-                        ((uint32_t)(now_ms - ble_device_list_refresh_start_ms) < BLE_DEVICE_LIST_REFRESH_MAX_WINDOW_MS)) {
-                    } else {
-                        rc = ble_send_device_list_response(active_conn_handle);
-                        ble_device_list_refresh_active = false;
-                        ble_device_list_refresh_start_ms = 0u;
-                        (void)rc;
-                    }
-                }
-            }
-
-            if (xSemaphoreTake(n2k_text_lock, pdMS_TO_TICKS(50)) == pdTRUE) {
-                if (latest_n2k_seq != last_sent_seq) {
-                    snprintf(ble_notify_task_payload, sizeof(ble_notify_task_payload), "%s", latest_n2k_text);
-                    last_sent_seq = latest_n2k_seq;
-                    has_new = true;
-                }
-                xSemaphoreGive(n2k_text_lock);
-            }
-
-            if (has_new && !ble_device_list_request_pending && !ble_device_list_refresh_active) {
-                rc = gatt_svr_notify_text(active_conn_handle, ble_notify_task_payload);
-
-                if (rc == 0) {
-                    ESP_LOGI(tag, "notification sent: %s", ble_notify_task_payload);
-                } else {
-                    ESP_LOGW(tag, "notification send failed, rc=%d", rc);
-                }
-            }
-        } else if (ble_device_list_request_pending || ble_device_list_refresh_active) {
-            ble_device_list_request_pending = false;
-            ble_device_list_refresh_active = false;
-            ble_device_list_refresh_start_ms = 0u;
+        /* If not connected, sleep briefly then re-check. */
+        if ((active_conn_handle == BLE_HS_CONN_HANDLE_NONE) ||
+            (ble_binary_frame_queue == NULL)) {
+            vTaskDelay(pdMS_TO_TICKS(BLE_NOTIFY_TASK_IDLE_DELAY_MS));
+            continue;
         }
 
-        vTaskDelay(loop_delay);
+        /* Block until at least one frame is available (or 100 ms timeout to
+         * re-check the connection handle). This eliminates the artificial
+         * 50 ms / 1000 ms polling delay and dispatches each frame immediately. */
+        size_t binary_count = 0u;
+        if (xQueueReceive(ble_binary_frame_queue,
+                          &binary_frames[0],
+                          pdMS_TO_TICKS(100u)) == pdTRUE) {
+            binary_count = 1u;
+            /* Drain any additional frames already queued (non-blocking). */
+            while ((binary_count < BLE_NOTIFY_BINARY_MAX_FRAMES) &&
+                   (xQueueReceive(ble_binary_frame_queue,
+                                  &binary_frames[binary_count],
+                                  0) == pdTRUE)) {
+                binary_count++;
+            }
+        }
+
+        if (binary_count > 0u) {
+            size_t binary_len = ble_build_binary_packet(binary_packet,
+                                                        sizeof(binary_packet),
+                                                        ble_binary_packet_sequence++,
+                                                        binary_frames,
+                                                        binary_count);
+            if (binary_len > 0u) {
+                rc = gatt_svr_notify_binary(active_conn_handle, binary_packet, (uint16_t)binary_len);
+                if (rc != 0) {
+                    ESP_LOGW(tag, "binary notification send failed, rc=%d", rc);
+                }
+            }
+        }
+        /* No vTaskDelay — loop immediately to wait for the next frame. */
     }
 }
 
@@ -1471,6 +825,7 @@ bleprph_advertise(void)
 {
     struct ble_gap_adv_params adv_params;
     struct ble_hs_adv_fields fields;
+    struct ble_hs_adv_fields rsp_fields;
 #if CONFIG_BT_NIMBLE_GAP_SERVICE
     const char *name;
 #endif
@@ -1498,12 +853,17 @@ bleprph_advertise(void)
      */
     fields.tx_pwr_lvl_is_present = 1;
     fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    fields.uuids128 = &advertised_service_uuid;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
 
 #if CONFIG_BT_NIMBLE_GAP_SERVICE
+    memset(&rsp_fields, 0, sizeof rsp_fields);
+
     name = ble_svc_gap_device_name();
-    fields.name = (uint8_t *)name;
-    fields.name_len = strlen(name);
-    fields.name_is_complete = 1;
+    rsp_fields.name = (uint8_t *)name;
+    rsp_fields.name_len = strlen(name);
+    rsp_fields.name_is_complete = 1;
 #endif
 
     rc = ble_gap_adv_set_fields(&fields);
@@ -1511,6 +871,14 @@ bleprph_advertise(void)
         MODLOG_DFLT(ERROR, "error setting advertisement data; rc=%d\n", rc);
         return;
     }
+
+#if CONFIG_BT_NIMBLE_GAP_SERVICE
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        MODLOG_DFLT(ERROR, "error setting scan response data; rc=%d\n", rc);
+        return;
+    }
+#endif
 
     /* Begin advertising. */
     memset(&adv_params, 0, sizeof adv_params);
@@ -1577,6 +945,24 @@ bleprph_gap_event(struct ble_gap_event *event, void *arg)
             bleprph_print_conn_desc(&desc);
             active_conn_handle = event->connect.conn_handle;
             ESP_LOGI(tag, "client connected; conn_handle=%d", active_conn_handle);
+
+            /* Request the lowest practical connection interval from the central.
+             * itvl_min/max are in BLE units of 1.25 ms.
+             *   6  = 7.5 ms  (minimum allowed)
+             *   12 = 15 ms
+             * The central (phone) may round up, but will not go higher than max. */
+            struct ble_gap_upd_params conn_params = {
+                .itvl_min            = 6,    /* 7.5 ms */
+                .itvl_max            = 12,   /* 15 ms  */
+                .latency             = 0,
+                .supervision_timeout = 400,  /* 4 s    */
+                .min_ce_len          = 0,
+                .max_ce_len          = 0,
+            };
+            rc = ble_gap_update_params(event->connect.conn_handle, &conn_params);
+            if (rc != 0) {
+                ESP_LOGW(tag, "conn param update request failed, rc=%d", rc);
+            }
         }
         MODLOG_DFLT(INFO, "\n");
 
@@ -1640,12 +1026,14 @@ bleprph_gap_event(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_TX:
-        MODLOG_DFLT(INFO, "notify_tx event; conn_handle=%d attr_handle=%d "
-                    "status=%d is_indication=%d",
-                    event->notify_tx.conn_handle,
-                    event->notify_tx.attr_handle,
-                    event->notify_tx.status,
-                    event->notify_tx.indication);
+        if (event->notify_tx.status != 0) {
+            MODLOG_DFLT(WARN, "notify_tx failed; conn_handle=%d attr_handle=%d "
+                        "status=%d is_indication=%d",
+                        event->notify_tx.conn_handle,
+                        event->notify_tx.attr_handle,
+                        event->notify_tx.status,
+                        event->notify_tx.indication);
+        }
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
@@ -1835,25 +1223,21 @@ void
 app_main(void)
 {
     int rc;
+    bool hci_inited = false;
 
-    n2k_text_lock = xSemaphoreCreateMutex();
-    if (n2k_text_lock == NULL) {
-        ESP_LOGE(tag, "failed to create n2k mutex");
-        return;
-    }
-    n2k_model_lock = xSemaphoreCreateMutex();
-    if (n2k_model_lock == NULL) {
-        ESP_LOGE(tag, "failed to create n2k model mutex");
-        return;
-    }
-    n2k_tx_queue = xQueueCreate(N2K_TX_QUEUE_LEN, sizeof(N2K_RawFrame_t));
-    if (n2k_tx_queue == NULL) {
-        ESP_LOGE(tag, "failed to create n2k tx queue");
-        return;
-    }
+    device_list_request_state_init(&device_list_request_state);
     n2k_app_model_init(&n2k_app_model);
-    n2k_decoder_init(&n2k_decoder, &n2k_app_model);
-    n2k_request_manager_init(&n2k_request_manager, N2K_LOCAL_SOURCE, n2k_enqueue_tx_frame, n2k_tx_queue);
+
+    spi_custom_tx_queue = xQueueCreate(SPI_CUSTOM_TX_QUEUE_LEN, sizeof(SpiQueuedPacket_t));
+    if (spi_custom_tx_queue == NULL) {
+        ESP_LOGE(tag, "failed to create spi custom tx queue");
+        return;
+    }
+    ble_binary_frame_queue = xQueueCreate(BLE_NOTIFY_BINARY_QUEUE_LEN, sizeof(N2K_RawFrame_t));
+    if (ble_binary_frame_queue == NULL) {
+        ESP_LOGE(tag, "failed to create binary frame queue");
+        return;
+    }
 
     /* Initialize NVS - it is used to store PHY calibration data */
     esp_err_t ret = nvs_flash_init();
@@ -1863,9 +1247,26 @@ app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* Best effort: reclaim Classic BT memory for NimBLE-only application. */
+    ret = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(tag, "Classic BT memory release skipped: %s", esp_err_to_name(ret));
+    }
+
+    ret = esp_nimble_hci_init();
+    if (ret == ESP_OK) {
+        hci_inited = true;
+    } else {
+        /* Some environments initialize controller differently; continue with host init fallback. */
+        ESP_LOGW(tag, "NimBLE HCI init failed (%s), trying host init fallback", esp_err_to_name(ret));
+    }
+
     ret = nimble_port_init();
     if (ret != ESP_OK) {
         ESP_LOGE(tag, "Failed to init nimble %d ", ret);
+        if (hci_inited) {
+            esp_nimble_hci_deinit();
+        }
         return;
     }
     /* Initialize the NimBLE host configuration. */
@@ -1890,7 +1291,7 @@ app_main(void)
 
 #if CONFIG_BT_NIMBLE_GAP_SERVICE
     /* Set the default device name. */
-    rc = ble_svc_gap_device_name_set("BLE Test");
+    rc = ble_svc_gap_device_name_set(BLE_DEVICE_ADV_NAME);
     assert(rc == 0);
 #endif
 
@@ -1906,8 +1307,7 @@ app_main(void)
     }
 #endif
 
-    /* Increased because device_list JSON + BLE notify path exceeded previous stack headroom. */
+    /* Stack kept larger to safely format and send multiline BLE text snapshots. */
     xTaskCreate(ble_test_notify_task, "ble_test_notify", BLE_NOTIFY_TASK_STACK_SIZE, NULL, 5, NULL);
-    xTaskCreate(spi_n2k_task, "spi_n2k_task", 4096, NULL, 6, NULL);
-    xTaskCreate(n2k_request_task, "n2k_request_task", 3072, NULL, 5, NULL);
+    xTaskCreate(spi_n2k_task, "spi_n2k_task", SPI_N2K_TASK_STACK_SIZE, NULL, 6, NULL);
 }
