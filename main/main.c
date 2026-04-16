@@ -62,7 +62,6 @@
 #define BLE_NOTIFY_BINARY_MAX_LEN 180
 #define BLE_NOTIFY_BINARY_PACKET_VERSION 1u
 #define BLE_NOTIFY_BINARY_PACKET_TYPE_FRAME_BATCH 1u
-#define BLE_NOTIFY_BINARY_PACKET_TYPE_BOAT_STATE 2u
 #define BLE_NOTIFY_BINARY_PACKET_HEADER_LEN 8u
 #define BLE_NOTIFY_BINARY_FRAME_LEN 14u
 #define BLE_NOTIFY_BINARY_MAX_FRAMES ((BLE_NOTIFY_BINARY_MAX_LEN - BLE_NOTIFY_BINARY_PACKET_HEADER_LEN) / BLE_NOTIFY_BINARY_FRAME_LEN)
@@ -74,10 +73,6 @@
 #define BLE_DEVICE_LIST_REFRESH_WINDOW_MS 3000u
 #define BLE_DEVICE_LIST_REFRESH_MAX_WINDOW_MS 6000u
 #define BLE_DEVICE_ADV_NAME "SDolve N2K BLE"
-
-/* BOAT_STATE BLE packet: 4-byte header + 36-byte payload = 40 bytes */
-#define BLE_BOAT_STATE_PAYLOAD_LEN 36u
-#define BLE_BOAT_STATE_PACKET_LEN  (4u + BLE_BOAT_STATE_PAYLOAD_LEN)
 
 #define DEVICE_LIST_PROTOCOL_VERSION 1u
 #define DEVICE_LIST_REQUEST_SRC 15u
@@ -608,29 +603,6 @@ static void spi_n2k_task(void *param) {
                     }
                 } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_STATUS) {
                     ESP_LOGI(tag, "SPI RX status payload_len=%u", (unsigned)packet.payload_len);
-                } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_BOAT_STATE) {
-                    /* Forward boat-state (averages + VMG) over BLE binary
-                     * characteristic.  Packet format:
-                     *   Byte 0:    version = 1
-                     *   Byte 1:    type    = 2 (BOAT_STATE)
-                     *   Bytes 2-3: sequence (uint16 LE)
-                     *   Bytes 4-31: 28-byte payload (7 × float32 LE) */
-                    if ((active_conn_handle != BLE_HS_CONN_HANDLE_NONE) &&
-                        (packet.payload_len == BLE_BOAT_STATE_PAYLOAD_LEN)) {
-                        uint8_t bs_pkt[BLE_BOAT_STATE_PACKET_LEN];
-                        bs_pkt[0] = BLE_NOTIFY_BINARY_PACKET_VERSION;
-                        bs_pkt[1] = BLE_NOTIFY_BINARY_PACKET_TYPE_BOAT_STATE;
-                        bs_pkt[2] = (uint8_t)(ble_binary_packet_sequence & 0xFFu);
-                        bs_pkt[3] = (uint8_t)((ble_binary_packet_sequence >> 8u) & 0xFFu);
-                        ble_binary_packet_sequence++;
-                        memcpy(&bs_pkt[4], packet.payload, BLE_BOAT_STATE_PAYLOAD_LEN);
-                        int rc = gatt_svr_notify_binary(active_conn_handle,
-                                                        bs_pkt,
-                                                        (uint16_t)sizeof(bs_pkt));
-                        if (rc != 0) {
-                            ESP_LOGW(tag, "boat_state BLE notify failed rc=%d", rc);
-                        }
-                    }
                 }
             }
         }

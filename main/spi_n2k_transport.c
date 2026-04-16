@@ -17,7 +17,6 @@ static bool spi_n2k_is_known_packet_type(uint8_t pkt_type) {
     return (pkt_type == SPI_N2K_PKT_TYPE_N2K_RX_FRAME) ||
            (pkt_type == SPI_N2K_PKT_TYPE_N2K_TX_FRAME) ||
            (pkt_type == SPI_N2K_PKT_TYPE_STATUS) ||
-           (pkt_type == SPI_N2K_PKT_TYPE_BOAT_STATE) ||
            (pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST) ||
            (pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST);
 }
