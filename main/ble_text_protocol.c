@@ -77,10 +77,17 @@ int ble_text_send_snapshot(uint16_t conn_handle,
                            uint32_t stale_hide_ms) {
     char line[BLE_TEXT_LINE_MAX_LEN + 1u];
     int rc;
+    int lines_sent = 0;
+    int lines_failed = 0;
 
     if (model == NULL) {
         return -1;
     }
+
+    ESP_LOGI(ble_proto_tag, "[SNAP START] devices=%u complete=%d in_progress=%d",
+             (unsigned)model->devices.count,
+             model->device_list.complete ? 1 : 0,
+             model->device_list.in_progress ? 1 : 0);
 
     snprintf(line,
              sizeof(line),
@@ -97,8 +104,10 @@ int ble_text_send_snapshot(uint16_t conn_handle,
     ESP_LOGI(ble_proto_tag, "[BLE TX] %s", line);
     rc = notify_line(conn_handle, line);
     if (rc != 0) {
+        ESP_LOGE(ble_proto_tag, "[SNAP] header notify FAILED rc=%d", rc);
         return rc;
     }
+    lines_sent++;
 
     snprintf(line,
              sizeof(line),
@@ -107,8 +116,10 @@ int ble_text_send_snapshot(uint16_t conn_handle,
     ESP_LOGI(ble_proto_tag, "[BLE TX] %s", line);
     rc = notify_line(conn_handle, line);
     if (rc != 0) {
+        ESP_LOGE(ble_proto_tag, "[SNAP] gateway line notify FAILED rc=%d", rc);
         return rc;
     }
+    lines_sent++;
 
     if (model->devices.entries == NULL) {
         return 0;
@@ -169,9 +180,16 @@ int ble_text_send_snapshot(uint16_t conn_handle,
         ESP_LOGI(ble_proto_tag, "[BLE TX] %s", line);
         rc = notify_line(conn_handle, line);
         if (rc != 0) {
-            return rc;
+            ESP_LOGE(ble_proto_tag, "[SNAP] device[%u] src=%u notify FAILED rc=%d (sent=%d failed=%d)",
+                     (unsigned)i, (unsigned)entry->source, rc, lines_sent, lines_failed + 1);
+            lines_failed++;
+            /* Continue sending remaining devices rather than aborting the whole
+               snapshot.  A partial list is better than nothing. */
+            continue;
         }
+        lines_sent++;
     }
 
-    return 0;
+    ESP_LOGI(ble_proto_tag, "[SNAP END] lines_sent=%d lines_failed=%d", lines_sent, lines_failed);
+    return lines_failed > 0 ? -1 : 0;
 }

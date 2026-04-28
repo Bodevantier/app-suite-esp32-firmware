@@ -41,8 +41,6 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "bleprph.h"
-#include "ble_text_protocol.h"
-#include "device_list_bridge.h"
 #include "n2k_raw_frame.h"
 #include "spi_n2k_transport.h"
 
@@ -70,15 +68,7 @@
 #define SPI_N2K_TASK_STACK_SIZE 8192
 #define BLE_NOTIFY_TASK_IDLE_DELAY_MS 1000u
 #define BLE_NOTIFY_TASK_REFRESH_POLL_MS 200u
-#define BLE_DEVICE_LIST_REFRESH_WINDOW_MS 3000u
-#define BLE_DEVICE_LIST_REFRESH_MAX_WINDOW_MS 6000u
 #define BLE_DEVICE_ADV_NAME "SDolve N2K BLE"
-
-#define DEVICE_LIST_PROTOCOL_VERSION 1u
-#define DEVICE_LIST_REQUEST_SRC 15u
-#define DEVICE_LIST_REQUEST_DST 255u
-#define DEVICE_LIST_REQUEST_PGN N2K_PGN_ADDRESS_CLAIM
-#define DEVICE_LIST_SNAPSHOT_TIMEOUT_MS 8000u
 
 typedef struct {
     uint8_t len;
@@ -114,13 +104,6 @@ static uint16_t active_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static QueueHandle_t spi_custom_tx_queue;
 static QueueHandle_t ble_binary_frame_queue;
 static uint16_t ble_binary_packet_sequence = 0u;
-static N2kAppModel_t n2k_app_model;
-static DeviceListRequestState_t device_list_request_state = {
-    .next_request_id = 1u,
-    .pending_request_id = 0u,
-    .pending = false,
-    .last_request_ms = 0u,
-};
 static volatile bool ble_device_list_request_pending = false;
 
 static bool spi_enqueue_custom_packet(const uint8_t *packet, size_t packet_len);
@@ -131,9 +114,7 @@ static size_t ble_build_binary_packet(uint8_t *out_buf,
                                       const N2K_RawFrame_t *frames,
                                       size_t frame_count);
 static bool spi_send_device_list_request(void);
-static void ble_notify_protocol_event(const char *fmt, ...);
 static void spi_log_packet_hex(const char *prefix, const uint8_t *data, size_t len);
-static void ble_publish_device_list_snapshot(void);
 
 static bool spi_enqueue_custom_packet(const uint8_t *packet, size_t packet_len) {
     SpiQueuedPacket_t queued;
@@ -199,25 +180,6 @@ static size_t ble_build_binary_packet(uint8_t *out_buf,
     return offset;
 }
 
-static void ble_notify_protocol_event(const char *fmt, ...) {
-    char line[BLE_NOTIFY_TEXT_MAX_LEN];
-    char notify_line[BLE_NOTIFY_TEXT_MAX_LEN + 1u];
-    va_list args;
-
-    if (fmt == NULL) {
-        return;
-    }
-
-    va_start(args, fmt);
-    vsnprintf(line, sizeof(line), fmt, args);
-    va_end(args);
-
-    if (active_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        snprintf(notify_line, sizeof(notify_line), "%s\n", line);
-        (void)gatt_svr_notify_text(active_conn_handle, notify_line);
-    }
-}
-
 static void spi_log_packet_hex(const char *prefix, const uint8_t *data, size_t len) {
     char line[3u * SPI_N2K_MAX_PACKET_LEN + 1u];
     size_t max_bytes;
@@ -251,60 +213,16 @@ static void spi_log_packet_hex(const char *prefix, const uint8_t *data, size_t l
              line);
 }
 
-static void ble_publish_device_list_snapshot(void) {
-    uint32_t now_ms;
-    uint32_t ref_ms;
-    int rc;
-
-    if (active_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
-
-    now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-    /* Use the snapshot's own last-update timestamp as the age reference so that
-       the stale filter measures age relative to when the data was captured, not
-       when it is published.  This prevents the timeout path (which fires
-       seconds after the last device record arrived) from hiding every device. */
-    ref_ms = n2k_app_model.device_list.last_update_ms;
-    if (ref_ms == 0u) {
-        ref_ms = now_ms;
-    }
-
-    rc = ble_text_send_snapshot(active_conn_handle,
-                                &n2k_app_model,
-                                N2K_LOCAL_SOURCE,
-                                ref_ms,
-                                BLE_DEVICE_LIST_REFRESH_WINDOW_MS,
-                                BLE_DEVICE_LIST_REFRESH_MAX_WINDOW_MS);
-    if (rc != 0) {
-        ESP_LOGW(tag, "device-list snapshot notify failed, rc=%d", rc);
-    }
-}
-
+/* Send a DEVICE_LIST_REQUEST SPI packet to the STM32.
+ * The STM32 will broadcast ISO Requests for AddressClaim, PGN List, and
+ * ProductInfo; responses arrive as regular N2K_RX_FRAME packets. */
 static bool spi_send_device_list_request(void) {
-    uint8_t payload[9];
     uint8_t packet[SPI_N2K_MAX_PACKET_LEN];
     size_t packet_len = 0u;
-    uint16_t request_id;
-    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-    if (!device_list_build_request_payload(&device_list_request_state,
-                                           now_ms,
-                                           DEVICE_LIST_PROTOCOL_VERSION,
-                                           DEVICE_LIST_REQUEST_SRC,
-                                           DEVICE_LIST_REQUEST_DST,
-                                           DEVICE_LIST_REQUEST_PGN,
-                                           payload,
-                                           sizeof(payload),
-                                           &request_id)) {
-        ESP_LOGE(tag, "DEVICE_LIST_REQUEST state/payload build failed");
-        return false;
-    }
 
     if (!spi_n2k_transport_build_custom_packet(SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST,
-                                                payload,
-                                                sizeof(payload),
+                                                NULL,
+                                                0u,
                                                 packet,
                                                 sizeof(packet),
                                                 &packet_len)) {
@@ -315,15 +233,8 @@ static bool spi_send_device_list_request(void) {
         ESP_LOGW(tag, "DEVICE_LIST_REQUEST queue full");
         return false;
     }
-
     spi_log_packet_hex("SPI TX", packet, packet_len);
-    ESP_LOGI(tag, "device-list request sent: request_id=%u src=%u dst=%u pgn=%lu",
-             (unsigned)request_id,
-             (unsigned)DEVICE_LIST_REQUEST_SRC,
-             (unsigned)DEVICE_LIST_REQUEST_DST,
-             (unsigned long)DEVICE_LIST_REQUEST_PGN);
-
-    ble_notify_protocol_event("device_list request sent id=%u", (unsigned)request_id);
+    ESP_LOGI(tag, "scan_n2k: DEVICE_LIST_REQUEST sent");
     return true;
 }
 
@@ -336,9 +247,11 @@ static void ble_handle_command_line(const char *command_line, void *ctx)
         return;
     }
 
-    if (ble_text_command_is_request_device_list(command_line)) {
+    /* Accept both legacy "request_device_list" and the new "scan_n2k" command. */
+    if ((strncmp(command_line, "request_device_list", 19) == 0) ||
+        (strncmp(command_line, "scan_n2k", 8) == 0)) {
         ble_device_list_request_pending = true;
-        ESP_LOGI(tag, "BLE command request_device_list accepted");
+        ESP_LOGI(tag, "BLE command scan_n2k accepted");
     } else {
         ESP_LOGW(tag, "BLE command ignored: unsupported command '%s'", command_line);
     }
@@ -361,9 +274,7 @@ static void spi_n2k_task(void *param) {
     static spi_slave_transaction_t trans[2];
     static SpiQueuedPacket_t tx_custom;
     static SpiN2kPacket_t packet;
-    static uint8_t log_packet[SPI_N2K_MAX_PACKET_LEN];
     static N2K_RawFrame_t frame;
-    static N2kDeviceEntry_t entry;
 
     spi_bus_config_t buscfg = {
         .mosi_io_num = PIN_NUM_MOSI,
@@ -439,198 +350,42 @@ static void spi_n2k_task(void *param) {
         for (int i = 0; i < rx_len_bytes; i++) {
             if (spi_n2k_transport_parser_consume_byte(&parser, rx[i], &packet)) {
 
-                /* Log raw hex only for device-list packets — N2K frame spam is suppressed. */
-                if ((packet.pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST) ||
-                    (packet.pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST_REQUEST)) {
-                    size_t log_len = 0u;
-                    if (spi_n2k_transport_build_custom_packet(packet.pkt_type,
-                                                              packet.payload,
-                                                              packet.payload_len,
-                                                              log_packet,
-                                                              sizeof(log_packet),
-                                                              &log_len)) {
-                        spi_log_packet_hex("SPI RX", log_packet, log_len);
-                    }
-                }
-
                 if (packet.pkt_type == SPI_N2K_PKT_TYPE_N2K_RX_FRAME) {
                     if (spi_n2k_transport_parse_frame_payload(&packet, &frame)) {
                         frame.flags |= N2K_RAW_FLAG_DIRECTION_RX;
-                        n2k_app_model_store_raw(&n2k_app_model, &frame);
-                        ble_queue_binary_frame(&frame);
-                    }
-                } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_DEVICE_LIST) {
-                    DeviceListBridgeEvent_t event;
-                    DeviceListPacketHeader_t header;
-                    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-
-                    (void)device_list_parse_packet_event(&device_list_request_state,
-                                                         now_ms,
-                                                         &packet,
-                                                         DEVICE_LIST_PROTOCOL_VERSION,
-                                                         &event);
-
-                    if (!device_list_parse_packet_header(&packet,
-                                                         DEVICE_LIST_PROTOCOL_VERSION,
-                                                         &header)) {
-                        ESP_LOGW(tag, "[DEVLIST] ERROR malformed header pkt_type=0x%02X payload_len=%u",
-                                 (unsigned)packet.pkt_type, (unsigned)packet.payload_len);
-                        n2k_app_model_mark_device_list_malformed(&n2k_app_model);
-                    } else if (header.message_type == DEVICE_LIST_BRIDGE_EVENT_BEGIN) {
-                        uint8_t own_source = 0u;
-                        uint8_t expected_count = 0u;
-
-                        if (!device_list_parse_snapshot_begin(&packet,
-                                                              DEVICE_LIST_PROTOCOL_VERSION,
-                                                              &header,
-                                                              &own_source,
-                                                              &expected_count)) {
-                            ESP_LOGW(tag, "[DEVLIST] ERROR parse BEGIN failed id=%u",
-                                     (unsigned)header.request_id);
-                            n2k_app_model_mark_device_list_malformed(&n2k_app_model);
-                        } else if (!n2k_app_model_device_list_begin(&n2k_app_model,
-                                                                     header.request_id,
-                                                                     header.snapshot_time_ms,
-                                                                     own_source,
-                                                                     expected_count,
-                                                                     now_ms)) {
-                            ESP_LOGW(tag, "[DEVLIST] BEGIN id=%u rejected by model (stale/duplicate?)",
-                                     (unsigned)header.request_id);
-                        } else {
-                            ESP_LOGI(tag, "[DEVLIST] BEGIN id=%u own_src=%u expected=%u snapshot_ms=%lu",
-                                     (unsigned)header.request_id,
-                                     (unsigned)own_source,
-                                     (unsigned)expected_count,
-                                     (unsigned long)header.snapshot_time_ms);
-                            ble_notify_protocol_event("device_list begin id=%u count=%u",
-                                                      (unsigned)header.request_id,
-                                                      (unsigned)expected_count);
-                        }
-                    } else if (header.message_type == DEVICE_LIST_BRIDGE_EVENT_DEVICE) {
-                        uint8_t record_index = 0u;
-                        uint8_t total_records = 0u;
-
-                        if (!device_list_parse_snapshot_device(&packet,
-                                                               DEVICE_LIST_PROTOCOL_VERSION,
-                                                               &header,
-                                                               &record_index,
-                                                               &total_records,
-                                                               &entry)) {
-                            ESP_LOGW(tag, "[DEVLIST] ERROR parse DEVICE failed id=%u",
-                                     (unsigned)header.request_id);
-                            n2k_app_model_mark_device_list_malformed(&n2k_app_model);
-                        } else if (!n2k_app_model_device_list_add_device(&n2k_app_model,
-                                                                          header.request_id,
-                                                                          record_index,
-                                                                          total_records,
-                                                                          &entry,
-                                                                          now_ms)) {
-                            ESP_LOGW(tag, "[DEVLIST] DEVICE %u/%u src=%u rejected by model",
-                                     (unsigned)(record_index + 1u),
-                                     (unsigned)total_records,
-                                     (unsigned)entry.source);
-                        } else {
-                            ESP_LOGI(tag, "[DEVLIST] DEVICE %u/%u src=%u mfg=%u prod=%u class=%u fn=%u model_id='%s' model='%s'",
-                                     (unsigned)(record_index + 1u),
-                                     (unsigned)total_records,
-                                     (unsigned)entry.source,
-                                     (unsigned)entry.manufacturer_code,
-                                     (unsigned)entry.product_code,
-                                     (unsigned)entry.device_class,
-                                     (unsigned)entry.device_function,
-                                     entry.model_id[0] ? entry.model_id : "(empty)",
-                                     entry.model[0] ? entry.model : "(empty)");
-                            ESP_LOGI(tag, "[DEVLIST] DEVICE %u/%u src=%u has_addr=%d has_prod=%d has_cfg=%d has_tx_pgn=%d(%u) has_rx_pgn=%d(%u) sw='%s' serial='%s'",
-                                     (unsigned)(record_index + 1u),
-                                     (unsigned)total_records,
-                                     (unsigned)entry.source,
-                                     entry.has_address_claim ? 1 : 0,
-                                     entry.has_product_info ? 1 : 0,
-                                     entry.has_configuration_info ? 1 : 0,
-                                     entry.has_tx_pgn_list ? 1 : 0,
-                                     (unsigned)entry.tx_pgn_count,
-                                     entry.has_rx_pgn_list ? 1 : 0,
-                                     (unsigned)entry.rx_pgn_count,
-                                     entry.software_version[0] ? entry.software_version : "(empty)",
-                                     entry.serial_code[0] ? entry.serial_code : "(empty)");
-                            ble_notify_protocol_event("device_list device %u/%u src=%u",
-                                                      (unsigned)(record_index + 1u),
-                                                      (unsigned)total_records,
-                                                      (unsigned)entry.source);
-
-                            /* Publish as soon as the last Device record arrives.
-                               The STM32 End binary often races the ESP32 timeout
-                               and the app should not wait 8 seconds for data it
-                               already has.  If the End binary arrives later it
-                               will trigger a second publish with complete=1, which
-                               the app handles gracefully. */
-                            if ((record_index + 1u) >= total_records) {
-                                ESP_LOGI(tag, "[DEVLIST] last record %u/%u received — publishing BLE snapshot early",
-                                         (unsigned)(record_index + 1u),
-                                         (unsigned)total_records);
-                                ble_publish_device_list_snapshot();
+                        /* Log AddressClaim / PGN-List / ProductInfo so we can
+                         * confirm N2K identity responses are reaching the ESP32. */
+                        {
+                            uint32_t _pf  = (frame.can_id >> 16) & 0xFFu;
+                            uint32_t _ps  = (frame.can_id >>  8) & 0xFFu;
+                            uint32_t _dp  = (frame.can_id >> 24) & 0x01u;
+                            uint32_t _pgn = (_dp << 16) | (_pf << 8) | (_pf < 240u ? 0u : _ps);
+                            uint8_t  _sa  = (uint8_t)(frame.can_id & 0xFFu);
+                            if (_pgn == 60928u || _pgn == 126464u || _pgn == 126996u) {
+                                ESP_LOGI(tag, "N2K identity SPI RX: pgn=%lu src=%u dlc=%u",
+                                         (unsigned long)_pgn, (unsigned)_sa, (unsigned)frame.dlc);
                             }
                         }
-                    } else if (header.message_type == DEVICE_LIST_BRIDGE_EVENT_COMPLETE) {
-                        uint8_t end_count = 0u;
-                        uint8_t final_count = 0u;
-
-                        if (!device_list_parse_snapshot_end(&packet,
-                                                            DEVICE_LIST_PROTOCOL_VERSION,
-                                                            &header,
-                                                            &end_count)) {
-                            ESP_LOGW(tag, "[DEVLIST] ERROR parse COMPLETE failed id=%u",
-                                     (unsigned)header.request_id);
-                            n2k_app_model_mark_device_list_malformed(&n2k_app_model);
-                        } else if (!n2k_app_model_device_list_end(&n2k_app_model,
-                                                                   header.request_id,
-                                                                   end_count,
-                                                                   now_ms,
-                                                                   &final_count)) {
-                            ESP_LOGW(tag, "[DEVLIST] COMPLETE id=%u end_count=%u rejected by model",
-                                     (unsigned)header.request_id,
-                                     (unsigned)end_count);
-                        } else {
-                            ESP_LOGI(tag, "[DEVLIST] COMPLETE id=%u end_count=%u final=%u -> publishing BLE snapshot",
-                                     (unsigned)header.request_id,
-                                     (unsigned)end_count,
-                                     (unsigned)final_count);
-                            ble_publish_device_list_snapshot();
-                            ble_notify_protocol_event("device_list complete id=%u devices=%u",
-                                                      (unsigned)header.request_id,
-                                                      (unsigned)final_count);
-                        }
+                        ble_queue_binary_frame(&frame);
                     }
                 } else if (packet.pkt_type == SPI_N2K_PKT_TYPE_STATUS) {
-                    ESP_LOGI(tag, "SPI RX status payload_len=%u", (unsigned)packet.payload_len);
+                    if ((packet.payload_len > 0u) &&
+                        (active_conn_handle != BLE_HS_CONN_HANDLE_NONE)) {
+                        char text_buf[SPI_N2K_MAX_PAYLOAD_LEN + 1u];
+                        size_t copy_len = (packet.payload_len < SPI_N2K_MAX_PAYLOAD_LEN)
+                                          ? packet.payload_len
+                                          : SPI_N2K_MAX_PAYLOAD_LEN;
+                        memcpy(text_buf, packet.payload, copy_len);
+                        text_buf[copy_len] = '\0';
+                        gatt_svr_notify_text_chunks(active_conn_handle, text_buf);
+                        ESP_LOGI(tag, "SPI STATUS->BLE len=%u", (unsigned)copy_len);
+                    } else {
+                        ESP_LOGI(tag, "SPI STATUS (no BLE conn) payload_len=%u",
+                                 (unsigned)packet.payload_len);
+                    }
+                } else {
+                    ESP_LOGD(tag, "SPI RX ignored pkt_type=0x%02X", (unsigned)packet.pkt_type);
                 }
-            }
-        }
-
-        n2k_app_model_note_spi_parser_stats(&n2k_app_model,
-                                            parser.stats.bad_sof,
-                                            parser.stats.bad_len,
-                                            parser.stats.bad_crc,
-                                            parser.stats.unknown_type);
-
-        {
-            uint16_t timed_out_request_id = 0u;
-            uint16_t dropped_request_id = 0u;
-            uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-            if (device_list_take_timeout(&device_list_request_state,
-                                         now_ms,
-                                         DEVICE_LIST_SNAPSHOT_TIMEOUT_MS,
-                                         &timed_out_request_id)) {
-                if (n2k_app_model_device_list_timeout_check(&n2k_app_model,
-                                                            now_ms,
-                                                            DEVICE_LIST_SNAPSHOT_TIMEOUT_MS,
-                                                            &dropped_request_id)) {
-                    ble_publish_device_list_snapshot();
-                }
-                if ((timed_out_request_id == 0u) && (dropped_request_id != 0u)) {
-                    timed_out_request_id = dropped_request_id;
-                }
-                ble_notify_protocol_event("device_list timeout id=%u", (unsigned)timed_out_request_id);
             }
         }
 
@@ -688,9 +443,18 @@ ble_test_notify_task(void *param)
                                                         binary_frames,
                                                         binary_count);
             if (binary_len > 0u) {
-                rc = gatt_svr_notify_binary(active_conn_handle, binary_packet, (uint16_t)binary_len);
+                /* Retry up to 5 times on mbuf exhaustion (BLE_HS_ENOMEM = 6).
+                 * A 50 ms yield lets the BLE stack free completed buffers. */
+                int _attempts = 0;
+                do {
+                    rc = gatt_svr_notify_binary(active_conn_handle, binary_packet, (uint16_t)binary_len);
+                    if (rc == BLE_HS_ENOMEM) {
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                        _attempts++;
+                    }
+                } while (rc == BLE_HS_ENOMEM && _attempts < 5);
                 if (rc != 0) {
-                    ESP_LOGW(tag, "binary notification send failed, rc=%d", rc);
+                    ESP_LOGW(tag, "binary notification send failed (attempts=%d) rc=%d", _attempts + 1, rc);
                 }
             }
         }
@@ -917,24 +681,13 @@ bleprph_gap_event(struct ble_gap_event *event, void *arg)
             bleprph_print_conn_desc(&desc);
             active_conn_handle = event->connect.conn_handle;
             ESP_LOGI(tag, "client connected; conn_handle=%d", active_conn_handle);
-
-            /* Request the lowest practical connection interval from the central.
-             * itvl_min/max are in BLE units of 1.25 ms.
-             *   6  = 7.5 ms  (minimum allowed)
-             *   12 = 15 ms
-             * The central (phone) may round up, but will not go higher than max. */
-            struct ble_gap_upd_params conn_params = {
-                .itvl_min            = 6,    /* 7.5 ms */
-                .itvl_max            = 12,   /* 15 ms  */
-                .latency             = 0,
-                .supervision_timeout = 400,  /* 4 s    */
-                .min_ce_len          = 0,
-                .max_ce_len          = 0,
-            };
-            rc = ble_gap_update_params(event->connect.conn_handle, &conn_params);
-            if (rc != 0) {
-                ESP_LOGW(tag, "conn param update request failed, rc=%d", rc);
-            }
+            /* Connection parameter update is intentionally deferred to the
+             * BLE_GAP_EVENT_SUBSCRIBE handler.  Requesting a very short
+             * interval (7.5-15 ms) immediately on connect races with the
+             * central's concurrent MTU exchange and service discovery, which
+             * can cause Android to terminate the connection (status=22 /
+             * GATT_CONN_TERMINATE_LOCAL_HOST).  Waiting until the client has
+             * finished GATT setup and written the CCCD avoids this race. */
         }
         MODLOG_DFLT(INFO, "\n");
 
@@ -1022,6 +775,29 @@ bleprph_gap_event(struct ble_gap_event *event, void *arg)
                  event->subscribe.attr_handle,
                  event->subscribe.cur_notify,
                  event->subscribe.cur_indicate);
+
+        /* Now that GATT setup is complete (MTU exchanged, services discovered,
+         * CCCD written) it is safe to request a shorter connection interval.
+         * itvl_min/max are in BLE units of 1.25 ms.
+         *   24 = 30 ms  (conservative but still fast for BLE notifications)
+         *   40 = 50 ms
+         * Requesting this here, rather than immediately on connect, avoids a
+         * race with Android's MTU + service-discovery operations that caused
+         * the connection to drop with status=22. */
+        if (event->subscribe.cur_notify) {
+            struct ble_gap_upd_params conn_params = {
+                .itvl_min            = 24,   /* 30 ms */
+                .itvl_max            = 40,   /* 50 ms */
+                .latency             = 0,
+                .supervision_timeout = 400,  /* 4 s   */
+                .min_ce_len          = 0,
+                .max_ce_len          = 0,
+            };
+            rc = ble_gap_update_params(event->subscribe.conn_handle, &conn_params);
+            if (rc != 0) {
+                ESP_LOGW(tag, "conn param update (post-subscribe) failed, rc=%d", rc);
+            }
+        }
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -1196,9 +972,6 @@ app_main(void)
 {
     int rc;
     bool hci_inited = false;
-
-    device_list_request_state_init(&device_list_request_state);
-    n2k_app_model_init(&n2k_app_model);
 
     spi_custom_tx_queue = xQueueCreate(SPI_CUSTOM_TX_QUEUE_LEN, sizeof(SpiQueuedPacket_t));
     if (spi_custom_tx_queue == NULL) {

@@ -400,7 +400,31 @@ gatt_svr_notify_text_chunks(uint16_t conn_handle, const char *text)
 
         memcpy(chunk, &text[offset], chunk_len);
         chunk[chunk_len] = '\0';
-        rc = gatt_svr_notify_text_unlocked(conn_handle, chunk);
+
+        /* Retry up to 15 times on ENOMEM: release the lock so the BLE host
+           task can drain its mbuf pool, yield 25 ms, then re-acquire. */
+        {
+            uint8_t attempt;
+            for (attempt = 0u; attempt < 15u; attempt++) {
+                rc = gatt_svr_notify_text_unlocked(conn_handle, chunk);
+                if (rc != BLE_HS_ENOMEM) {
+                    break;
+                }
+                MODLOG_DFLT(WARN,
+                            "gatt_svr_notify_text_chunks: ENOMEM attempt=%u offset=%u total=%u — retrying in 25 ms\n",
+                            (unsigned)attempt, (unsigned)offset, (unsigned)total_len);
+                xSemaphoreGive(gatt_svr_notify_lock);
+                vTaskDelay(pdMS_TO_TICKS(25u));
+                if (xSemaphoreTake(gatt_svr_notify_lock, portMAX_DELAY) != pdTRUE) {
+                    return BLE_HS_ETIMEOUT;
+                }
+            }
+            if (rc == BLE_HS_ENOMEM) {
+                MODLOG_DFLT(ERROR,
+                            "gatt_svr_notify_text_chunks: ENOMEM after 15 retries offset=%u total=%u — DROPPING remaining\n",
+                            (unsigned)offset, (unsigned)total_len);
+            }
+        }
         if (rc != 0) {
             xSemaphoreGive(gatt_svr_notify_lock);
             return rc;
