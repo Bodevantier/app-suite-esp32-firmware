@@ -51,16 +51,17 @@
 #define PIN_NUM_CS       10
 #define SPI_RX_BUF_SIZE  256
 #define SPI_CUSTOM_TX_QUEUE_LEN 8
-#define N2K_LOCAL_SOURCE 0x31u
-#define N2K_PGN_ADDRESS_CLAIM 60928u
-#define N2K_PGN_SUPPORTED_PGN_LIST 126464u
-#define N2K_PGN_PRODUCT_INFO 126996u
-#define N2K_PGN_CONFIGURATION_INFO 126998u
+/* The ESP32 is not on the N2K bus and does not participate as an N2K node.
+   The bridge identity (gateway entry seen in the Flutter app) is owned by
+   the STM32 (src=15) and emitted via the device-list STATUS-text channel.
+   N2K_LOCAL_SOURCE and the N2K_PGN_* defines were removed in the cleanup
+   pass \u2014 if you need PGN constants again, include a shared header instead
+   of redefining them per file. */
 #define BLE_NOTIFY_TEXT_MAX_LEN 180
 #define BLE_NOTIFY_BINARY_MAX_LEN 180
 #define BLE_NOTIFY_BINARY_PACKET_VERSION 1u
 #define BLE_NOTIFY_BINARY_PACKET_TYPE_FRAME_BATCH 1u
-#define BLE_NOTIFY_BINARY_PACKET_HEADER_LEN 8u
+#define BLE_NOTIFY_BINARY_PACKET_HEADER_LEN 6u
 #define BLE_NOTIFY_BINARY_FRAME_LEN 14u
 #define BLE_NOTIFY_BINARY_MAX_FRAMES ((BLE_NOTIFY_BINARY_MAX_LEN - BLE_NOTIFY_BINARY_PACKET_HEADER_LEN) / BLE_NOTIFY_BINARY_FRAME_LEN)
 #define BLE_NOTIFY_BINARY_QUEUE_LEN 64
@@ -160,9 +161,7 @@ static size_t ble_build_binary_packet(uint8_t *out_buf,
     out_buf[offset++] = (uint8_t)(sequence & 0xFFu);
     out_buf[offset++] = (uint8_t)((sequence >> 8u) & 0xFFu);
     out_buf[offset++] = (uint8_t)frame_count;
-    out_buf[offset++] = 0u;
-    out_buf[offset++] = 0u;
-    out_buf[offset++] = 0u;
+    out_buf[offset++] = 0u;  /* packet_flags reserved */
 
     for (size_t i = 0u; i < frame_count; i++) {
         uint8_t dlc = n2k_raw_frame_clamp_dlc(frames[i].dlc);
