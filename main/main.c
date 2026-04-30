@@ -237,6 +237,31 @@ static bool spi_send_device_list_request(void) {
     return true;
 }
 
+/* Send a DEVICE_FORGET SPI packet to the STM32. The 1-byte payload is the
+ * N2K source address the app wants the bridge to drop from its cached
+ * device-list table. */
+static bool spi_send_device_forget(uint8_t source) {
+    uint8_t packet[SPI_N2K_MAX_PACKET_LEN];
+    size_t packet_len = 0u;
+
+    if (!spi_n2k_transport_build_custom_packet(SPI_N2K_PKT_TYPE_DEVICE_FORGET,
+                                                &source,
+                                                1u,
+                                                packet,
+                                                sizeof(packet),
+                                                &packet_len)) {
+        ESP_LOGE(tag, "DEVICE_FORGET build failed src=%u", source);
+        return false;
+    }
+    if (!spi_enqueue_custom_packet(packet, packet_len)) {
+        ESP_LOGW(tag, "DEVICE_FORGET queue full src=%u", source);
+        return false;
+    }
+    spi_log_packet_hex("SPI TX", packet, packet_len);
+    ESP_LOGI(tag, "forget_device: SPI request sent src=%u", source);
+    return true;
+}
+
 static void ble_handle_command_line(const char *command_line, void *ctx)
 {
     (void)ctx;
@@ -251,6 +276,19 @@ static void ble_handle_command_line(const char *command_line, void *ctx)
         (strncmp(command_line, "scan_n2k", 8) == 0)) {
         ble_device_list_request_pending = true;
         ESP_LOGI(tag, "BLE command scan_n2k accepted");
+    } else if (strncmp(command_line, "forget_device", 13) == 0) {
+        /* Format: "forget_device src=<0-251>" */
+        const char *src_kv = strstr(command_line, "src=");
+        if (src_kv == NULL) {
+            ESP_LOGW(tag, "forget_device: missing src= field");
+            return;
+        }
+        long src = strtol(src_kv + 4, NULL, 10);
+        if ((src < 0) || (src > 251)) {
+            ESP_LOGW(tag, "forget_device: src=%ld out of range", src);
+            return;
+        }
+        (void)spi_send_device_forget((uint8_t)src);
     } else {
         ESP_LOGW(tag, "BLE command ignored: unsupported command '%s'", command_line);
     }
