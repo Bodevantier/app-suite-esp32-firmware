@@ -69,7 +69,7 @@
 #define SPI_N2K_TASK_STACK_SIZE 8192
 #define BLE_NOTIFY_TASK_IDLE_DELAY_MS 1000u
 #define BLE_NOTIFY_TASK_REFRESH_POLL_MS 200u
-#define BLE_DEVICE_ADV_NAME "SDolve N2K BLE"
+#define BLE_DEVICE_ADV_NAME "SDolve Bluetooth"
 
 typedef struct {
     uint8_t len;
