@@ -27,3 +27,39 @@ CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_2M_PHY=y
 CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_CODED_PHY=n
 CONFIG_BT_NIMBLE_EXT_SCAN=n
 CONFIG_BT_NIMBLE_ENABLE_PERIODIC_SYNC=n
+
+#
+# Power management
+#
+# Drop CPU to 80 MHz – BLE + SPI slave + main loop run trivially at 80 MHz
+# and average current drops by ~20–25 mA vs 160 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=n
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=80
+
+# Enable Dynamic Frequency Scaling so the CPU can drop further while the
+# main task is blocked on the SPI/BLE queues. Light-sleep cannot trigger
+# while the SPI slave has a transaction queued (APB lock), but DFS still
+# helps during idle gaps.
+CONFIG_PM_ENABLE=y
+CONFIG_PM_DFS_INIT_AUTO=y
+
+# Bluetooth controller modem-sleep – single biggest BLE saving (typ. -15
+# to -25 mA average when idle/connected). Mode 1 puts the radio + 40 MHz
+# crystal to sleep between scheduled BLE events. The low-power clock is
+# derived from the main crystal (no external 32 kHz needed).
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
+
+# Reduce maximum PHY TX power. +9 dBm (default 20 = +20*0.5 = +10 dBm)
+# is overkill for a phone in the same boat console. 9 ≈ +4.5 dBm and
+# saves a few mA on every BLE event. Lower further (e.g. 3 = -1.5 dBm)
+# if your link budget allows.
+CONFIG_ESP_PHY_MAX_TX_POWER=9
+
+# Quieter logging in production – every printed line wakes the CPU and
+# UART. Switch to WARN by default; flip back to INFO for debugging.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=n
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2

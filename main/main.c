@@ -657,6 +657,12 @@ bleprph_advertise(void)
     memset(&adv_params, 0, sizeof adv_params);
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    /* Power-saving: advertise slowly while no client is connected. Units of
+     * 0.625 ms.  800 = 500 ms, 1600 = 1 s.  Android still discovers within
+     * 1–2 s but the radio duty cycle drops ~10× vs the NimBLE fast default
+     * (30–60 ms), saving a few mA average while idle. */
+    adv_params.itvl_min = 800;
+    adv_params.itvl_max = 1600;
     rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, bleprph_gap_event, NULL);
     if (rc != 0) {
@@ -818,6 +824,9 @@ bleprph_gap_event(struct ble_gap_event *event, void *arg)
          * itvl_min/max are in BLE units of 1.25 ms.
          *   24 = 30 ms  (conservative but still fast for BLE notifications)
          *   40 = 50 ms
+         * latency=2 lets the peripheral skip up to 2 connection events
+         * when there is no data, cutting average BLE radio current
+         * noticeably while still keeping responsiveness <150 ms.
          * Requesting this here, rather than immediately on connect, avoids a
          * race with Android's MTU + service-discovery operations that caused
          * the connection to drop with status=22. */
@@ -825,7 +834,7 @@ bleprph_gap_event(struct ble_gap_event *event, void *arg)
             struct ble_gap_upd_params conn_params = {
                 .itvl_min            = 24,   /* 30 ms */
                 .itvl_max            = 40,   /* 50 ms */
-                .latency             = 0,
+                .latency             = 2,
                 .supervision_timeout = 400,  /* 4 s   */
                 .min_ce_len          = 0,
                 .max_ce_len          = 0,
