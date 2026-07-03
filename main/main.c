@@ -43,7 +43,9 @@
 #include "bleprph.h"
 #include "n2k_raw_frame.h"
 #include "spi_n2k_transport.h"
+#include "led_strip.h"
 
+#define RGB_LED_GPIO     48   /* GPIO48 on ESP32-S3-DevKitC-1 v1.1; change to 38 for v1.0 */
 #define SPI_SLAVE_HOST   SPI2_HOST
 #define PIN_NUM_MOSI     11
 #define PIN_NUM_MISO     13
@@ -1013,11 +1015,28 @@ void bleprph_host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+static void rgb_led_off(void)
+{
+    led_strip_config_t strip_cfg = {
+        .strip_gpio_num = RGB_LED_GPIO,
+        .max_leds = 1,
+    };
+    led_strip_rmt_config_t rmt_cfg = {
+        .resolution_hz = 10 * 1000 * 1000,
+    };
+    led_strip_handle_t strip;
+    if (led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &strip) == ESP_OK) {
+        led_strip_clear(strip);
+    }
+}
+
 void
 app_main(void)
 {
     int rc;
     bool hci_inited = false;
+
+    rgb_led_off();
 
     spi_custom_tx_queue = xQueueCreate(SPI_CUSTOM_TX_QUEUE_LEN, sizeof(SpiQueuedPacket_t));
     if (spi_custom_tx_queue == NULL) {
