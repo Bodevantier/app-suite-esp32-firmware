@@ -1085,7 +1085,12 @@ app_main(void)
     ble_hs_cfg.gatts_register_cb = gatt_svr_register_cb;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
-    /* Keep pairing/security simple for easy phone testing. */
+    /* Keep pairing/security simple for easy/fast phone testing. Bonding +
+     * LE Secure Connections was tried and reverted: it forced Android
+     * through a full re-pairing negotiation on many reconnects (observed
+     * bond getting spontaneously dropped, likely via the repeat-pairing
+     * handler below deleting its stored bond), adding tens of seconds to
+     * reconnect time. Not worth it for a private boat instrument. */
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_bonding = 0;
     ble_hs_cfg.sm_mitm = 0;
